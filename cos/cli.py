@@ -8,6 +8,7 @@ import os
 import sys
 import time
 
+from . import pause
 from .runner import ENGINES, MODES, TERMINAL, Run, list_runs, valid_run_id
 
 COLORS = {
@@ -101,10 +102,31 @@ def cmd_tail(args) -> int:
 
 
 def cmd_serve(args) -> int:
+    from .config import exit_with_parent
     from .server import serve
 
+    exit_with_parent()
     serve(args.host, args.port)
     return 0
+
+
+def cmd_pause(args) -> int:
+    pause.pause(pause.parse_duration(args.duration) if args.duration else None)
+    print(pause.describe())
+    return 0
+
+
+def cmd_resume(args) -> int:
+    pause.resume()
+    print(pause.describe())
+    return 0
+
+
+def cmd_paused(args) -> int:
+    """Exit 0 while notifications are paused, 1 otherwise: `python -m cos paused && exit 0` in a job."""
+    if not args.quiet:
+        print(pause.describe())
+    return 0 if pause.is_paused() else 1
 
 
 def main(argv=None) -> int:
@@ -140,6 +162,17 @@ def main(argv=None) -> int:
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8787)
     p.set_defaults(func=cmd_serve)
+
+    p = sub.add_parser("pause", help="stop the Slack messages neo posts on its own")
+    p.add_argument("duration", nargs="?", help="30m, 2h, 1d; omit to pause until `resume`")
+    p.set_defaults(func=cmd_pause)
+
+    p = sub.add_parser("resume", help="turn neo's Slack notifications back on")
+    p.set_defaults(func=cmd_resume)
+
+    p = sub.add_parser("paused", help="exit 0 while notifications are paused (for scheduled jobs)")
+    p.add_argument("--quiet", action="store_true")
+    p.set_defaults(func=cmd_paused)
 
     args = parser.parse_args(argv)
     try:

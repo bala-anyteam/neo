@@ -118,6 +118,13 @@ class AlertGate:
         """In-progress status posts in this channel still worth re-checking."""
         return [k.split(":", 1)[1] for k in self.pending if k.startswith(f"{channel}:")]
 
+    def release(self, text: str) -> None:
+        """Give back what admit() took for an alert whose RCA was not run (notifications paused):
+        its daily-cap slot and its repeat window, so the same alert after the pause is still looked at."""
+        self.seen.pop(alert_signature(text), None)
+        self.state["count"] = max(0, self.state.get("count", 0) - 1)
+        self.save()
+
     def cursor(self, channel: str) -> Optional[str]:
         return self.state.get(channel)
 

@@ -47,7 +47,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
-from . import ask, brief, cards, digest, fleet, home, loops, memory, mentions, settings, watches, work
+from . import ask, brief, cards, digest, fleet, home, loops, memory, mentions, pause, settings, watches, work
 from .config import agent_brief, default_engine, owner_fields, workdir
 from .herdr import HerdrError
 from .runner import ENGINES, TERMINAL, Run, list_runs, valid_run_id
@@ -230,7 +230,7 @@ def fresh_meta(run: Run) -> dict:
     meta = run.meta()
     if meta.get("runtime", "headless") != "headless":
         return meta  # interactive runs have no child process; their watcher owns status
-    if meta["status"] == "running" and not pid_alive(meta.get("pid")):
+    if meta["status"] == "running" and not pid_alive(meta.get("pid")) and not pid_alive(meta.get("retry_owner")):
         with ACTIVE_LOCK:
             owned = run.id in ACTIVE
         if not owned:
@@ -434,7 +434,7 @@ class Handler(BaseHTTPRequestHandler):
         if parts == ["api", "overview"]:
             # Each agent and task carries needs / result (home.annotate), so its row can say Idle, Partly done, Needs you.
             data = home.annotate(fleet.overview(), cards.STORE.read(), fleet.seen.get)
-            return self._json({**board_overview(data), "default_engine": default_engine(),
+            return self._json({**board_overview(data), "default_engine": default_engine(), "notifications": pause.state(),
                                "findings": [board_finding(f) for f in watches.open_findings()]})
         if parts == ["api", "home"]:
             raw = (parse_qs(urlparse(self.path).query).get("since") or [""])[0]
@@ -446,7 +446,7 @@ class Handler(BaseHTTPRequestHandler):
         if parts == ["api", "watches"]:
             return self._json(watches.listing())
         if parts == ["api", "settings"]:
-            return self._json({"default_engine": default_engine()})
+            return self._json({"default_engine": default_engine(), "notifications": pause.state()})
         if len(parts) == 3 and parts[:2] == ["api", "findings"]:
             found = watches.get_finding(parts[2])
             return self._json(watches.view(found)) if found else self._error(HTTPStatus.NOT_FOUND, "no such finding")
@@ -465,8 +465,8 @@ class Handler(BaseHTTPRequestHandler):
             events = fleet.recent_turns(fleet.transcript_events(engine, path), turns=8)
             return self._json({**info, "events": events})
         if parts == ["api", "memory"]:
-            from . import learn
-            return self._json({"dir": str(learn.memory_dir()), "files": learn.all_files()})
+            from . import autonomy, learn
+            return self._json({"dir": str(learn.memory_dir()), "files": learn.all_files(), "review": autonomy.view()})
         if parts == ["api", "usage"]:
             from .runner import usage_summary
 
@@ -546,6 +546,18 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(HTTPStatus.BAD_REQUEST, str(exc))
             start_turn(run, None)
             return self._json(run.meta(), HTTPStatus.CREATED)
+        if parts == ["api", "memory", "apply"]:
+            from . import autonomy
+            which, shown = (body or {}).get("which"), (body or {}).get("review")
+            if not (which == "all" or (isinstance(which, list) and which
+                                        and all(isinstance(n, int) and not isinstance(n, bool) and 0 < n < 100 for n in which))):
+                return self._error(HTTPStatus.BAD_REQUEST, "which must be \"all\" or a list of proposal numbers")
+            if not isinstance(shown, str) or not shown:
+                return self._error(HTTPStatus.BAD_REQUEST, "the id of the review shown is required; reload the page")
+            try:
+                return self._json({"results": autonomy.apply_from_dashboard(which, shown), "review": autonomy.view()})
+            except ValueError as exc:
+                return self._error(HTTPStatus.CONFLICT, str(exc))
         if parts == ["api", "home", "seen"]:
             home.mark_seen()
             return self._json({"ok": True})
@@ -588,10 +600,18 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(HTTPStatus.NOT_FOUND, str(exc))
         if parts == ["api", "settings"]:
             try:
-                settings.save(**{k: v for k, v in (body or {}).items() if k in ("default_engine",)})
+                body = body or {}
+                choice = body.get("notifications")
+                if "notifications" in body and choice not in (None, "on", pause.FOREVER):
+                    if not isinstance(choice, str):
+                        raise ValueError("notifications must be \"on\", \"forever\" or a duration like \"2h\"")
+                    pause.parse_duration(choice)  # validate before saving anything
+                settings.save(**{k: v for k, v in body.items() if k in ("default_engine",)})
+                if "notifications" in body:
+                    pause.apply(choice)
             except ValueError as exc:
                 return self._error(HTTPStatus.BAD_REQUEST, str(exc))
-            return self._json({"default_engine": default_engine()})
+            return self._json({"default_engine": default_engine(), "notifications": pause.state()})
         if parts == ["api", "watches"]:
             try:
                 return self._json(watches.save(body or {}), HTTPStatus.CREATED)
@@ -604,6 +624,16 @@ class Handler(BaseHTTPRequestHandler):
                 watches.delete(parts[2])
                 return self._json({"ok": True})
             return self._json(watches.start(parts[2], "dashboard"), HTTPStatus.ACCEPTED)
+        if len(parts) == 4 and parts[:2] == ["api", "system-watches"] and parts[3] in ("run", "on", "off"):
+            from . import system_watches
+            try:
+                if parts[3] == "run":
+                    return self._json(system_watches.run(parts[2]), HTTPStatus.ACCEPTED)
+                return self._json(system_watches.set_on(parts[2], parts[3] == "on"))
+            except ValueError as exc:
+                return self._error(HTTPStatus.BAD_REQUEST, str(exc))
+            except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
+                return self._error(HTTPStatus.BAD_GATEWAY, str(exc))
         if len(parts) == 4 and parts[:2] == ["api", "findings"] and parts[3] in ("dismiss", "reopen"):
             try:
                 return self._json(watches.set_status(parts[2], "dismissed" if parts[3] == "dismiss" else "new"))
@@ -813,6 +843,9 @@ def adopt_orphans() -> list[str]:
             continue
         run = Run(meta["id"])
         if not pid_alive(meta.get("pid")):
+            if not meta.get("pid") and meta.get("retry_owner") and not pid_alive(meta["retry_owner"]):
+                # Waiting to auto-restart when the bot that owned it stopped: nobody will resume it.
+                run.update_meta(status="failed", retry_owner=None, note="bot restarted during an auto-restart wait")
             continue
 
         def follow(run=run):

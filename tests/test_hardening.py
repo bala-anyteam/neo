@@ -235,6 +235,16 @@ class FleetAsksTest(unittest.TestCase):
             self.assertEqual(first[0], "Done?")
             self.assertEqual(first[2], 1)
 
+    def test_last_text_is_only_the_latest_turns_reply(self):
+        from cos import fleet
+        user = lambda t: json.dumps({"type": "user", "message": {"content": t}}) + "\n"  # noqa: E731
+        said = lambda t: json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": t}]}}) + "\n"  # noqa: E731
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "t.jsonl"
+            path.write_text(user("go") + said("Status: needs-you — pick A or B") + user("A"))
+            # interrupted before it said anything: the old ask is not this turn's reply
+            self.assertEqual(fleet._last_text_for("claude", path, path.stat().st_mtime)[0], "")
+
     def test_valid_target(self):
         from cos import fleet
         self.assertTrue(fleet.valid_target("default", "w12:p3"))
@@ -322,3 +332,17 @@ class RecentTurnsTest(unittest.TestCase):
         from cos.fleet import recent_turns
         events = [{"kind": "prompt", "body": "q"}, {"kind": "text", "body": "a"}]
         self.assertEqual(recent_turns(events), events)
+
+
+class RepoDirUnreadableTest(unittest.TestCase):
+    def setUp(self):
+        from cos import work
+        self.work = work
+        work._repo_dirs.update(map={"acme/app": "/old/app"}, at=0.0)
+
+    def test_unreadable_work_folder_keeps_last_map(self):
+        # launchd's python sometimes gets EINTR listing ~/Documents; the dashboard must still load.
+        with patch.object(Path, "iterdir", side_effect=InterruptedError(4, "Interrupted system call")):
+            self.assertEqual(self.work.repo_dir("acme/app"), "/old/app")
+            self.assertIsNone(self.work.repo_dir("acme/other"))
+        self.assertEqual(self.work._repo_dirs["at"], 0.0)  # not cached: retried on the next call

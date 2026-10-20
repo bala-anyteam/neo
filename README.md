@@ -67,6 +67,16 @@ thread instead.) Tune with `NEO_NOTIFY_USER`, `NEO_NOTIFY_MIN_WORK_SECONDS`, `NE
 used when you don't name one: Slack mentions, +, PR reviews and fixes, and work on findings. It is stored in
 `settings.json` and wins over `NEO_DEFAULT_ENGINE`.
 
+**Controller engine.** `NEO_CONTROLLER_ENGINE=codex` moves decision cards, structured digests,
+and nightly autonomy proposals to Codex; the default remains `claude`. Set `NEO_CONTROLLER_MODEL`
+to choose its model (otherwise Codex uses its default; Claude retains the existing per-feature model).
+This setting is independent of the default task agent. New runs from a card's *Do it* button also use
+this engine; continuing an existing run keeps its engine. Structured calls run with no tools,
+MCP servers, user/project instructions, plugins, or hooks in a temporary directory. Codex needs a
+current CLI with `--ignore-user-config`, `--ignore-rules`, and a bundled model catalog.
+Connector-dependent morning briefs, watches, loop checks, dashboard asks, and mention read/send/task
+flows retain Claude and its existing tool restrictions; Codex has no equivalent connectors here.
+
 **Watches** (Work tab) are standing checks on a schedule: *Sentry* (new and regressed production issues) is on
 by default every 2 hours in work hours (Mon-Fri 08:00-20:00), and so is *Production errors* (`gcloud logging`
 on the project in `NEO_GCP_PROD_PROJECT`) when that is set; *CI on main* (the `NEO_GITHUB_ORG` repositories, or

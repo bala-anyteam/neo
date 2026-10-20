@@ -40,7 +40,7 @@ from commands import Progress, clip, code_block  # noqa: E402
 from cos import brief as morning, fleet, pause, settings, watches  # noqa: E402
 from cos.alerts import AlertGate  # noqa: E402
 from cos import autonomy, learn  # noqa: E402
-from cos.config import OWNER_MESSAGE_MARK, THREAD_CONTEXT_HEAD, agent_brief, default_engine, exit_with_parent, workdir  # noqa: E402
+from cos.config import controller_engine, controller_model, OWNER_MESSAGE_MARK, THREAD_CONTEXT_HEAD, agent_brief, default_engine, exit_with_parent, workdir  # noqa: E402
 from cos.herdr import Herdr, HerdrError  # noqa: E402
 from cos.interactive import InteractiveRun  # noqa: E402
 from cos.runner import ENGINES, MODES, Run, cos_home, list_runs, pid_alive  # noqa: E402
@@ -1341,6 +1341,7 @@ async def main() -> None:
         raise SystemExit(f"NEO_MODE must be one of {MODES}")
     if default_engine() not in ENGINES:
         raise SystemExit(f"NEO_DEFAULT_ENGINE must be one of {ENGINES}")
+    log.info("Controller engine=%s model=%s", controller_engine(), controller_model() or "engine default")
     if not ALLOWED_USER_IDS:
         log.warning("ALLOWED_USER_IDS is empty: anyone in the workspace can run agents on this machine")
     global TEAM_URL

@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Optional
 
 from . import learn
+from .controller import structured
 from .config import THREAD_CONTEXT_HEAD, split_thread_context
 from .runner import cli_path, runs_dir
 
@@ -234,18 +235,8 @@ def material(data: dict) -> str:
 def draft(data: dict, timeout: int = 300) -> list[dict]:
     """The model's proposals, or [] when the call fails (the digest still goes out with the numbers)."""
     # Run logs are untrusted text: no tools, no MCP servers, no user settings or hooks, an empty cwd.
-    cmd = [cli_path("claude"), "-p", "--output-format", "json", "--model", MODEL, "--tools", "",
-           "--strict-mcp-config", "--setting-sources", "", "--json-schema", json.dumps(SCHEMA),
-           "--", PROMPT.format(max=MAX_PROPOSALS, material=material(data))]
-    cwd = Path(tempfile.gettempdir()) / "neo-autonomy"
-    try:
-        cwd.mkdir(exist_ok=True)
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL, cwd=str(cwd))
-        raw = json.loads(proc.stdout)
-    except (OSError, subprocess.TimeoutExpired, ValueError):
-        log.warning("autonomy draft failed", exc_info=True)
-        return []
-    out = (raw.get("structured_output") or {}).get("proposals") if isinstance(raw, dict) else None
+    out = structured(PROMPT.format(max=MAX_PROPOSALS, material=material(data)), SCHEMA, MODEL, timeout, "neo-autonomy")
+    out = (out or {}).get("proposals")
     keep = [p for p in out or [] if isinstance(p, dict) and p.get("kind") in ("rule", "lesson", "owner_action")
             and str(p.get("text") or "").strip()]
     return keep[:MAX_PROPOSALS]

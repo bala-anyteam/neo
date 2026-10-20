@@ -24,7 +24,8 @@ from pathlib import Path
 from typing import Optional
 
 from . import cards, digest_view, fleet
-from .config import owner_fields, owner_name
+from .controller import structured
+from .config import controller_model, owner_fields, owner_name
 from .runner import Run, cli_path, cos_home, valid_run_id
 
 log = logging.getLogger(__name__)
@@ -194,17 +195,7 @@ def needs_build(target: dict, have: Optional[dict], now: float) -> bool:
 def make(title: str, material: str, needs_you: str = "", timeout: int = 420) -> Optional[dict]:
     # The log is untrusted text: no tools, no MCP servers, no user settings or hooks, an empty cwd.
     needs = f"\nThe card for this task says it needs {owner_name()} for: {needs_you}" if needs_you else ""
-    cmd = [cli_path("claude"), "-p", "--output-format", "json", "--model", MODEL, "--tools", "",
-           "--strict-mcp-config", "--setting-sources", "", "--json-schema", json.dumps(SCHEMA),
-           "--", PROMPT.format(title=title, needs=needs, material=material[-cards.MATERIAL_CHARS:], **owner_fields())]
-    cwd = Path(tempfile.gettempdir()) / "neo-digest"
-    try:
-        cwd.mkdir(exist_ok=True)
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL, cwd=str(cwd))
-        raw = json.loads(proc.stdout)
-    except (OSError, subprocess.TimeoutExpired, ValueError):
-        return None
-    out = raw.get("structured_output") if isinstance(raw, dict) else None
+    out = structured(PROMPT.format(title=title, needs=needs, material=material[-cards.MATERIAL_CHARS:], **owner_fields()), SCHEMA, MODEL, timeout, "neo-digest")
     if not isinstance(out, dict) or out.get("kind") not in KINDS or not str(out.get("intent") or "").strip():
         return None
     out["outcome"] = {"result": out.pop("outcome_result", ""), "headline": out.pop("outcome_headline", "")}
@@ -220,7 +211,7 @@ def build(target: dict) -> Optional[dict]:
     if out is None:
         return None
     digest = {"kind": out["kind"], "data": out, "source_mtime": target["mtime"],
-              "made_at": time.time(), "model": MODEL, "version": VERSION}
+              "made_at": time.time(), "model": controller_model(MODEL) or "codex default", "version": VERSION}
     put(target["key"], digest)
     return digest
 

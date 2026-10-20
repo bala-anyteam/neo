@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Optional
 
 from . import fleet
+from .controller import structured
 from .config import owner_fields, split_thread_context
 from .runner import Run, cli_path
 from .store import JsonStore
@@ -142,18 +143,7 @@ def recent_topics() -> list[str]:
 
 def make_card(title: str, material: str, timeout: int = 180) -> Optional[dict]:
     # The log is untrusted text: no tools, no MCP servers, no user settings or hooks, an empty cwd.
-    cmd = [cli_path("claude"), "-p", "--output-format", "json", "--model", MODEL, "--tools", "",
-           "--strict-mcp-config", "--setting-sources", "", "--json-schema", json.dumps(CARD_SCHEMA),
-           "--", PROMPT.format(title=title, topics=", ".join(recent_topics()) or "none yet",
-                             material=material[-MATERIAL_CHARS:], **owner_fields())]
-    cwd = Path(tempfile.gettempdir()) / "neo-card"
-    try:
-        cwd.mkdir(exist_ok=True)
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL, cwd=str(cwd))
-        raw = json.loads(proc.stdout)
-    except (OSError, subprocess.TimeoutExpired, ValueError):
-        return None
-    card = raw.get("structured_output") if isinstance(raw, dict) else None
+    card = structured(PROMPT.format(title=title, topics=", ".join(recent_topics()) or "none yet", material=material[-MATERIAL_CHARS:], **owner_fields()), CARD_SCHEMA, MODEL, timeout, "neo-card")
     if not isinstance(card, dict) or card.get("result") not in RESULTS:
         return None
     card.setdefault("links", [])

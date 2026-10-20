@@ -109,3 +109,21 @@ def exit_with_parent() -> None:
         os._exit(0)
 
     threading.Thread(target=watch, daemon=True, name="parent-watch").start()
+
+
+def controller_engine() -> str:
+    """Engine for Neo's own planning; independent of the user's task-agent choice."""
+    engine = os.environ.get("NEO_CONTROLLER_ENGINE", "claude").strip().lower()
+    if engine not in ("claude", "codex"):
+        raise ValueError("NEO_CONTROLLER_ENGINE must be claude or codex")
+    return engine
+
+
+def controller_model(claude_default: Optional[str] = None) -> Optional[str]:
+    """Do not send a Claude-specific legacy model to Codex."""
+    return os.environ.get("NEO_CONTROLLER_MODEL") or (claude_default if controller_engine() == "claude" else None)
+
+
+def controller_args() -> list[str]:
+    model = controller_model()
+    return ["--model", model] if model else []

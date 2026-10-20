@@ -48,7 +48,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
 from . import ask, brief, cards, digest, fleet, home, loops, memory, mentions, pause, settings, watches, work
-from .config import agent_brief, default_engine, owner_fields, workdir
+from .config import controller_engine, controller_args, agent_brief, default_engine, owner_fields, workdir
 from .herdr import HerdrError
 from .runner import ENGINES, TERMINAL, Run, list_runs, valid_run_id
 
@@ -282,8 +282,8 @@ def do_recommendation(key: str) -> dict:
             start_turn(run, prompt)
             return {"ok": True, "where": "run", "id": run.id}
         context = f"Context: an earlier neo run ({run.id}, {card.get('title', '')!r}) did: {card.get('did', '')}\n"
-        new = Run.create("claude", context + prompt, workdir(), "full", source="dashboard",
-                         extra={"kind": "do", "title": f"Do: {card.get('title', key)[:100]}"})
+        new = Run.create(controller_engine(), context + prompt, workdir(), "full", source="dashboard",
+                         extra={"kind": "do", "title": f"Do: {card.get('title', key)[:100]}", "cli_args": controller_args()})
         start_turn(new, None)
         return {"ok": True, "where": "run", "id": new.id}
     raise LookupError("unknown item")

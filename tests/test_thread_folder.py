@@ -122,6 +122,12 @@ class ThreadFolderTest(unittest.IsolatedAsyncioTestCase):
         run_id, _ = await self._say("second")
         self.assertEqual(FolderRun.runs[run_id]["cwd"], str(self.old.resolve()))
 
+    async def test_same_thread_refreshes_owner_brief(self):
+        await self._say("codex first")
+        with patch.object(app,"agent_brief",return_value="Latest scoped owner approvals"):
+            run_id,_=await self._say("second")
+        self.assertEqual(FolderRun.runs[run_id].get("system_prompt"),"Latest scoped owner approvals")
+
 
 if __name__ == "__main__":
     unittest.main()

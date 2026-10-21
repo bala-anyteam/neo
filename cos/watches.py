@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import threading
 import tempfile
 from datetime import datetime, timedelta
@@ -24,7 +25,7 @@ from typing import Callable, Optional
 
 from . import system_watches
 from .config import workdir
-from .runner import Run, cos_home, list_runs, now_iso
+from .runner import Run, cli_path, cos_home, list_runs, now_iso
 
 EVERY = (30, 60, 120, 240, 1440)  # minutes
 HOURS = ("work", "always")  # work: Monday to Friday, 08:00 to 20:00 local time
@@ -365,6 +366,70 @@ def cli_args(engine: str = "claude") -> tuple[list[str], list[str]]:
     return every_turn, ["--json-schema", json.dumps(FINDINGS_SCHEMA)]
 
 
+WATCH_FAILURE_COOLDOWN_MINUTES = 30
+_AUTH_QUOTA = re.compile(
+    r"credit balance|quota|usage limit|hit your limit|rate limit|not logged in|login required"
+    r"|authentication|unauthorized|invalid.api.key|expired.token|oauth|please.*log.?in", re.I)
+
+
+def _cooling(watch: dict) -> bool:
+    if watch.get("cooldown_engine") != watch.get("engine", "claude"):
+        return False
+    try:
+        until = datetime.fromisoformat(watch.get("cooldown_until") or "")
+        return datetime.now(until.tzinfo) < until
+    except (ValueError, TypeError):
+        return False
+
+
+def _preflight(watch: dict) -> Optional[str]:
+    """Local capability checks only; no auth probes, models or engine fallback."""
+    engine = watch.get("engine", "claude")
+    if engine not in ("claude", "codex"):
+        return "Unsupported selected watch engine"
+    if engine == "codex" and not watch.get("issue_repo"):
+        return "Codex issue watches require issue_repo for a read-only snapshot"
+    selected = cli_path(engine)
+    if not shutil.which(selected):
+        return f"Selected {engine} CLI is unavailable or not executable"
+    return None
+
+
+def _cooldown_deadline(meta: dict) -> str:
+    # Re-adopting/inspecting the same failure must not keep extending the cooldown.
+    try:
+        failed_at = datetime.fromisoformat(meta.get("updated_at") or meta["created_at"])
+    except (ValueError, TypeError, KeyError):
+        failed_at = datetime.now()
+    return (failed_at + timedelta(minutes=WATCH_FAILURE_COOLDOWN_MINUTES)).isoformat()
+
+
+def _known_failure(run: Run) -> bool:
+    meta = run.meta()
+    if meta.get("watch_preflight_error"):
+        return True
+    errors = []
+    for name, limit in (("events.jsonl", 65536), ("stderr.log", 16384)):
+        try:
+            with (run.dir / name).open("rb") as fh:
+                size = fh.seek(0, 2)
+                fh.seek(max(0, size - limit))
+                text = fh.read(limit).decode("utf-8", errors="replace")
+            if name == "stderr.log":
+                errors.append(text)
+            else:
+                for line in text.splitlines():
+                    try:
+                        event = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(event, dict) and event.get("kind") == "error":
+                        errors.append(str(event.get("body", "")))
+        except OSError:
+            pass
+    return bool(_AUTH_QUOTA.search("\n".join(errors)))
+
+
 def start(watch_id: str, source: str = "schedule") -> dict:
     """Check now in the background (or return the check already running)."""
     with _lock:
@@ -374,17 +439,31 @@ def start(watch_id: str, source: str = "schedule") -> dict:
         current = running(watch_id)
         if current:
             return current
+        if source == "schedule" and _cooling(watch) and watch.get("last_run_id"):
+            try:
+                previous = Run(watch["last_run_id"]).meta()
+                if previous.get("status") == "failed" and previous.get("engine") == watch.get("engine", "claude"):
+                    return previous
+            except (OSError, ValueError):
+                pass
         engine = watch.get("engine", "claude")
+        preflight_error = _preflight(watch)
         every_turn, first_turn = cli_args(engine)
         run = Run.create(engine, prompt(watch), workdir(), "readonly", source=source,
                          extra={"kind": "watch", "watch_id": watch_id, "title": f"Watch: {watch['name']}",
                                 "cli_args": every_turn, "first_turn_args": first_turn})
-        if engine == "codex":
+        if engine == "codex" and not preflight_error:
             from .controller import _strict_schema
             schema_path = run.dir / "findings-schema.json"
             schema_path.write_text(json.dumps(_strict_schema(FINDINGS_SCHEMA)))
             run.update_meta(first_turn_args=["--output-schema", str(schema_path)])
         _update(watch_id, last_started_at=datetime.now().isoformat(timespec="seconds"), last_run_id=run.id)
+
+    if preflight_error:
+        run.append_event({"kind": "error", "title": "Watch preflight failed", "body": preflight_error, "data": {}}, 1)
+        run.update_meta(status="failed", pid=None, watch_preflight_error=preflight_error)
+        checked(run)
+        return run.meta()
 
     def work():
         try:
@@ -467,6 +546,11 @@ def checked(run: Run) -> list[dict]:
     """A check ended (also one a previous bot process started): record it and tell on_checked."""
     meta = run.meta()
     watch = get(meta.get("watch_id") or "") or {"id": meta.get("watch_id"), "name": meta.get("title", "Watch")}
+    if meta["status"] == "failed" and _known_failure(run) and get(watch["id"]):
+        _update(watch["id"], cooldown_until=_cooldown_deadline(meta),
+                cooldown_engine=meta.get("engine", "claude"))
+    elif meta["status"] == "done" and get(watch["id"]):
+        _update(watch["id"], cooldown_until=None, cooldown_engine=None)
     new = finish(watch, run, meta["created_at"]) if meta["status"] == "done" else []
     if on_checked:
         try:

@@ -10,6 +10,10 @@ Layout per run (under COS_HOME/runs/<run_id>/):
 from __future__ import annotations
 
 import json
+import hashlib
+import fcntl
+import math
+import sys
 import os
 import re
 import secrets
@@ -120,6 +124,9 @@ def engine_env(meta: dict) -> dict:
     """The bot's environment plus this run's id and Slack thread (none inherited from the bot)."""
     env = {k: v for k, v in os.environ.items() if k not in ("NEO_SLACK_CHANNEL", "NEO_SLACK_THREAD")}
     env["NEO_RUN_ID"] = meta["id"]
+    env["COS_HOME"] = str(cos_home())
+    env["NEO_TASKS_CLI"] = str(Path(__file__).with_name("tasks.py"))
+    env["NEO_TASKS_PYTHON"] = sys.executable
     target = _slack_target(meta)
     if target:
         env["NEO_SLACK_CHANNEL"], env["NEO_SLACK_THREAD"] = target
@@ -186,14 +193,40 @@ def validate_request(engine: str, prompt: str, cwd: str, mode: str) -> Optional[
     return None
 
 
-_LOCKS: dict[str, threading.RLock] = {}
+class _ProcessRunLock:
+    """Reentrant thread lock plus a per-run flock shared by bot, dashboard and CLI."""
+    def __init__(self, path):
+        self.path, self.thread_lock, self.local = path, threading.RLock(), threading.local()
+
+    def __enter__(self):
+        self.thread_lock.acquire()
+        try:
+            depth = getattr(self.local, "depth", 0)
+            if depth == 0:
+                self.local.handle = self.path.open("a")
+                fcntl.flock(self.local.handle, fcntl.LOCK_EX)
+            self.local.depth = depth + 1
+            return self
+        except BaseException:
+            self.thread_lock.release()
+            raise
+
+    def __exit__(self, *args):
+        self.local.depth -= 1
+        if self.local.depth == 0:
+            fcntl.flock(self.local.handle, fcntl.LOCK_UN)
+            self.local.handle.close()
+        self.thread_lock.release()
+
+
+_LOCKS = {}
 _LOCKS_GUARD = threading.Lock()
 
 
-def _run_lock(run_id: str) -> threading.RLock:
-    """One lock per run id, shared by every Run object in this process."""
+def _run_lock(run_id):
+    path = runs_dir() / run_id / ".state.lock"
     with _LOCKS_GUARD:
-        return _LOCKS.setdefault(run_id, threading.RLock())
+        return _LOCKS.setdefault(str(path), _ProcessRunLock(path))
 
 
 _WAKES: dict[str, threading.Event] = {}
@@ -331,28 +364,115 @@ class Run:
                     return current  # another caller cancelled or resumed it
                 wake.clear()
                 self.update_meta(status="running", pid=None, retry_owner=os.getpid(),
-                                 waiting_continuations=attempts + 1)
+                                 waiting_continuations=attempts + 1,
+                                 continuation={"kind":"waiting", "prompt":WAITING_CONTINUATION_PROMPT,
+                                               "due_at":time.time()+delay, "turn":final["turns"], "attempt":attempts+1})
             emit(self.append_event({"kind": "status", "title": "Continue unfinished task",
                                     "body": f"Resuming in {delay:.0f}s ({attempts + 1}/{len(WAITING_CONTINUATION_DELAYS)})",
                                     "data": {"waiting_continuation": attempts + 1}}, final["turns"]))
-            wake.wait(delay)
+            self._wait_checkpoint(wake, delay)
             final = self._execute_with_restarts(WAITING_CONTINUATION_PROMPT, on_event, retrying=True)
             attempts += 1
         return final
 
+    def _wait_checkpoint(self, wake, delay):
+        deadline = time.monotonic() + delay
+        while time.monotonic() < deadline:
+            if wake.wait(min(.5, max(0, deadline-time.monotonic()))):
+                break
+            meta = self.meta()
+            if meta.get("status") != "running" or meta.get("retry_owner") != os.getpid():
+                break
+
+    @staticmethod
+    def pending_valid(meta):
+        pending = meta.get("continuation")
+        if (not isinstance(pending, dict) or meta.get("status") != "running"
+                or meta.get("pid") or pending.get("turn") != meta.get("turns")
+                or pending.get("kind") not in ("waiting", "api")):
+            return False
+        limit = len(WAITING_CONTINUATION_DELAYS) if pending["kind"] == "waiting" else len(AUTO_RESTART_DELAYS)
+        if (type(pending.get("attempt")) is not int or not 1 <= pending["attempt"] <= limit
+                or not isinstance(pending.get("due_at"), (float,int)) or not math.isfinite(pending["due_at"])):
+            return False
+        if pending["kind"] == "waiting":
+            return bool(meta.get("source") == "slack" and meta.get("conclude") and meta.get("session_id")
+                        and isinstance(pending.get("prompt"), str))
+        return pending.get("prompt") is None or isinstance(pending.get("prompt"), str)
+
+    def _resume_pending(self, on_event=None):
+        """Claim only an explicit durable wait left by a dead owner, once across processes."""
+        emit = on_event or (lambda _e: None)
+        with self._lock:
+            meta = self.meta()
+            pending = meta.get("continuation")
+            if not self.pending_valid(meta) or pid_alive(meta.get("retry_owner")):
+                return None
+            from . import tasks
+            try:
+                gate = tasks.show(self.id).get("block")
+            except (OSError,ValueError):
+                gate = "task contract is unreadable; inspect it before resuming"
+            if gate:
+                final = self.update_meta(status="done",retry_owner=None,continuation=None,
+                                         conclusion={"state":"needs-you","line":gate})
+                emit(self.append_event({"kind":"result","title":"Human approval required",
+                                        "body":"Status: needs-you — " + gate,"data":{}},meta["turns"]))
+                return final
+            self.update_meta(retry_owner=os.getpid(), api_retry_offset=pending.get("attempt", 0)
+                             if pending["kind"] == "api" else 0)
+        emit(self.append_event({"kind":"status", "title":"Recovered continuation",
+                                "body":"Resuming the existing task after a runner restart",
+                                "data":{"continuation_recovered":True}}, meta["turns"]))
+        wake = _wake_event(self.id)
+        wake.clear()
+        self._wait_checkpoint(wake, max(0, min(180, float(pending["due_at"])-time.time())))
+        final = self._execute_with_restarts(pending.get("prompt"), on_event, retrying=True,
+                                            keep_first_turn_args=bool(pending.get("keep_first_turn_args")))
+        return self._continue_waiting(final, on_event)
+
+    def _guard_task_claim(self, text, emit, turn):
+        from . import tasks
+        state = (conclusion.status_of(text) or {}).get("state")
+        if state in ("needs-you", "blocked", "failed") or not (self.dir / "task.json").exists():
+            return text
+        try:
+            task = tasks.show(self.id)
+            if task.get("block"):
+                return "Task awaits the recorded approval.\nStatus: needs-you — " + task["block"]
+            if task.get("status") == "completed":
+                return text
+            if state == "waiting":
+                return text
+            unmet = tasks.unmet(self.id)
+        except (OSError, ValueError):
+            unmet = ["task evidence could not be read; inspect the recorded contract"]
+        self.update_meta(task_contract=True)
+        if not unmet:
+            if tasks.complete(self.id, task.get("revision")):
+                return text
+            unmet = ["task contract changed before completion could be recorded"]
+        emit(self.append_event({"kind":"status", "title":"Completion evidence missing",
+                                "body":"; ".join(unmet)[:1000],
+                                "data":{"completion_refused":True,"unmet":unmet}}, turn))
+        return ("The recorded task still has unmet outcomes: " + "; ".join(unmet)[:1000]
+                + "\nStatus: waiting — continuing the recorded task; completion evidence is missing.")
+
     def _execute_with_restarts(self, prompt: Optional[str] = None,
-                               on_event: Optional[Callable[[dict], None]] = None, retrying: bool = False) -> dict:
+                               on_event: Optional[Callable[[dict], None]] = None, retrying: bool = False,
+                               keep_first_turn_args: bool = False) -> dict:
         """Run one turn to completion. Without a prompt, runs the initial prompt. A turn that ends
         on a transient engine error is resumed with "continue" (see AUTO_RESTART_DELAYS).
 
         While it waits the run stays "running" with no engine pid and retry_owner set to this
         process: callers keep treating it as busy, and if this process dies, fresh_meta() sees a
         dead owner and closes the run out as it does for any engine lost in a restart."""
-        final = self._execute_turn(prompt, on_event, retrying=retrying)
+        final = self._execute_turn(prompt, on_event, retrying=retrying, keep_first_turn_args=keep_first_turn_args)
         emit = on_event or (lambda _e: None)
-        first_turn = prompt is None
+        first_turn = prompt is None or keep_first_turn_args
         wake = _wake_event(self.id)
-        for attempt, delay in enumerate((*AUTO_RESTART_DELAYS, None), 1):
+        retry_offset = int(self.meta().get("api_retry_offset") or 0) if retrying else 0
+        for attempt, delay in enumerate((*AUTO_RESTART_DELAYS[retry_offset:], None), retry_offset + 1):
             if (final.get("status") != "failed" or self._cancelled or self._turn_answered
                     or not is_transient_engine_error(self._last_error)):
                 break
@@ -368,13 +488,17 @@ class Run:
                 if self.meta()["status"] != "failed":
                     break  # someone else moved the run on (a dashboard message, a cancel)
                 wake.clear()
-                self.update_meta(status="running", pid=None, retry_owner=os.getpid())
+                retry_prompt = AUTO_RESTART_PROMPT if final.get("session_id") else prompt
+                self.update_meta(status="running", pid=None, retry_owner=os.getpid(),
+                                 continuation={"kind":"api", "prompt":retry_prompt, "due_at":time.time()+delay,
+                                               "turn":final["turns"], "attempt":attempt,
+                                               "keep_first_turn_args":first_turn})
             emit(self.append_event({
                 "kind": "status", "title": "Auto-restart",
                 "body": f"{final['engine']} API error; retrying in {delay:.0f}s ({attempt}/{len(AUTO_RESTART_DELAYS)})",
                 "data": {"auto_restart": attempt, "error": (self._last_error or "")[:500]},
             }, turn))
-            wake.wait(delay)
+            self._wait_checkpoint(wake, delay)
             if final.get("session_id"):
                 final = self._execute_turn(AUTO_RESTART_PROMPT, on_event, keep_first_turn_args=first_turn, retrying=True)
             else:  # died before a session existed: run the same turn again
@@ -393,20 +517,40 @@ class Run:
                 return meta  # cancelled (or taken over) while we waited
             if meta["status"] == "running" and not retrying:
                 raise RuntimeError("run is already executing a turn")
+            if retrying and (self.dir / "task.json").exists():
+                from . import tasks
+                try:
+                    gate = tasks.show(self.id).get("block")
+                except (OSError,ValueError):
+                    return self.update_meta(status="failed",pid=None,retry_owner=None,continuation=None,
+                                            conclusion={"state":"blocked","line":"Task contract is unreadable"})
+                if gate:
+                    final = self.update_meta(status="done",pid=None,retry_owner=None,continuation=None,
+                                             conclusion={"state":"needs-you","line":gate})
+                    if on_event:
+                        on_event(self.append_event({"kind":"result","title":"Human approval required",
+                                                    "body":"Status: needs-you — " + gate,"data":{}},meta["turns"]))
+                    return final
             is_follow_up = prompt is not None
             if is_follow_up and not meta.get("session_id"):
                 raise RuntimeError("no session id recorded yet; cannot send a follow-up")
             turn = meta["turns"] + 1
             self._cancelled = False
             self._last_error, self._turn_answered = None, False
-            self.write_meta({**meta, "status": "running", "turns": turn, "pid": None, "retry_owner": None, "conclusion": None})
+            self.write_meta({**meta, "status": "running", "turns": turn, "pid": None, "retry_owner": None,
+                             "conclusion": None, "continuation": None,
+                             "api_retry_offset": meta.get("api_retry_offset",0) if retrying else 0})
 
         engine, mode, cwd = meta["engine"], meta["mode"], meta["cwd"]
         text = prompt if is_follow_up else meta["prompt"]
         emit = on_event or (lambda _e: None)
         try:
             system = "\n\n".join(filter(None, (meta.get("system_prompt"), run_context(meta)))) or None
-            cmd = build_command(engine, text, mode, meta["session_id"] if is_follow_up else None,
+            brief_digest = hashlib.sha256((system or "").encode()).hexdigest()
+            command_text = text
+            if engine == "codex" and is_follow_up and system and meta.get("brief_digest") != brief_digest:
+                command_text = f"Updated standing instructions and owner memory:\n{system}\n\n---\n\n{text}"
+            cmd = build_command(engine, command_text, mode, meta["session_id"] if is_follow_up else None,
                                 system=system, conclude=bool(meta.get("conclude")),
                                 extra_args=(meta.get("cli_args") or [])
                                 + (meta.get("first_turn_args") or [] if keep_first_turn_args or not is_follow_up else []))
@@ -430,7 +574,10 @@ class Run:
                          turn_started_at=time.time())
         if self._cancelled:  # stop requested while we were starting
             self._kill(self._proc.pid)
-        return self._follow(emit, turn, engine, offset, meta.get("cost_usd") or 0.0, time.time(), proc=self._proc)
+        final = self._follow(emit, turn, engine, offset, meta.get("cost_usd") or 0.0, time.time(), proc=self._proc)
+        if final.get("status") == "done":
+            self.update_meta(brief_digest=brief_digest)
+        return final
 
     def _follow(self, emit, turn: int, engine: str, offset: int, cost: float, started: float,
                 proc: Optional[subprocess.Popen] = None, pid: Optional[int] = None) -> dict:
@@ -478,6 +625,8 @@ class Run:
                             data = event.get("data") or {}
                             if event["kind"] == "session" and data.get("session_id"):
                                 self.update_meta(session_id=data["session_id"])
+                            if engine == "claude" and event["kind"] == "result":
+                                event["body"] = self._guard_task_claim(event["body"], emit, turn)
                             if event["kind"] == "text" or (engine == "claude" and event["kind"] == "result"):
                                 last_text = event["body"]
                             if event["kind"] in ("result", "error") and "cost_usd" in data:
@@ -497,6 +646,7 @@ class Run:
             else:  # not our child: judge by what the engine wrote
                 code = 0 if completed and not failed_turn else 1
             if engine == "codex" and not saw_result and code == 0:
+                last_text = self._guard_task_claim(last_text, emit, turn)
                 emit(self.append_event({"kind": "result", "title": "Final result", "body": last_text, "data": {}}, turn))
 
             if self._cancelled:
@@ -532,8 +682,10 @@ class Run:
         """Keep following a turn a previous bot process started, if its engine is still running.
         Returns the final meta, or None when there is nothing to adopt."""
         meta = self.meta()
-        if meta.get("runtime", "headless") != "headless" or meta["status"] != "running" or not pid_alive(meta.get("pid")):
+        if meta.get("runtime", "headless") != "headless" or meta["status"] != "running":
             return None
+        if not pid_alive(meta.get("pid")):
+            return self._resume_pending(on_event)
         final = self._follow(on_event or (lambda _e: None), meta.get("turns") or 1, meta["engine"],
                             int(meta.get("raw_offset") or 0), float(meta.get("cost_before_turn") or 0.0),
                             float(meta.get("turn_started_at") or time.time()), pid=meta["pid"])
@@ -556,7 +708,7 @@ class Run:
             pid = proc.pid if proc else meta.get("pid")
             if not pid and meta.get("status") == "running" and meta.get("retry_owner"):
                 # Waiting to auto-restart: don't, and wake the waiter so it gives up now.
-                self.update_meta(status="cancelled", retry_owner=None)
+                self.update_meta(status="cancelled", retry_owner=None, continuation=None)
                 _wake_event(self.id).set()
                 return True
         if not pid:
@@ -565,7 +717,7 @@ class Run:
             return False
         if proc is None:
             # Another process owns the run; record the outcome ourselves.
-            self.update_meta(status="cancelled", pid=None)
+            self.update_meta(status="cancelled", pid=None, continuation=None)
         return True
 
 

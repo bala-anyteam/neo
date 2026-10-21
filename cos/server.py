@@ -230,7 +230,8 @@ def fresh_meta(run: Run) -> dict:
     meta = run.meta()
     if meta.get("runtime", "headless") != "headless":
         return meta  # interactive runs have no child process; their watcher owns status
-    if meta["status"] == "running" and not pid_alive(meta.get("pid")) and not pid_alive(meta.get("retry_owner")):
+    if (meta["status"] == "running" and not Run.pending_valid(meta)
+            and not pid_alive(meta.get("pid")) and not pid_alive(meta.get("retry_owner"))):
         with ACTIVE_LOCK:
             owned = run.id in ACTIVE
         if not owned:
@@ -842,7 +843,7 @@ def adopt_orphans() -> list[str]:
         if meta.get("runtime", "headless") != "headless" or meta.get("status") != "running":
             continue
         run = Run(meta["id"])
-        if not pid_alive(meta.get("pid")):
+        if not pid_alive(meta.get("pid")) and not Run.pending_valid(meta):
             if not meta.get("pid") and meta.get("retry_owner") and not pid_alive(meta["retry_owner"]):
                 # Waiting to auto-restart when the bot that owned it stopped: nobody will resume it.
                 run.update_meta(status="failed", retry_owner=None, note="bot restarted during an auto-restart wait")

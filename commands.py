@@ -149,8 +149,11 @@ class Progress:
         if kind == "tool_call":
             self.step_count += 1
             self.steps.append(f"`{_one_line(tool_label(event['title']), 40)}` {_one_line(event['body'])}")
-        elif kind == "tool_result" and data.get("is_error") and self.steps:
-            self.steps[-1] += "  :x:"
+        elif kind == "tool_result" and data.get("is_error"):
+            if self.steps:
+                self.steps[-1] += "  :x:"
+            self.errors.append(f"{_one_line(event.get('title') or 'Tool failed', 60)}: "
+                               f"{_one_line(event.get('body') or 'Tool execution failed; see full trace', 300)}")
         elif kind == "text":
             self.latest = event["body"]
             self.final = event["body"]
@@ -183,10 +186,11 @@ class Progress:
         if self.cost:
             head += f" · ${self.cost:.2f}"
         lines = [head]
-        hidden = len(self.steps) - STEP_LINES
-        if hidden > 0:
-            lines.append(f"_…{hidden} earlier step{'s' if hidden != 1 else ''}_")
-        lines += [f"• {s}" for s in self.steps[-STEP_LINES:]]
+        if os.environ.get("NEO_PROGRESS_DEBUG", "").lower() in {"1", "true", "yes"}:
+            hidden = len(self.steps) - STEP_LINES
+            if hidden > 0:
+                lines.append(f"_…{hidden} earlier step{'s' if hidden != 1 else ''}_")
+            lines += [f"• {s}" for s in self.steps[-STEP_LINES:]]
         if self.latest and not finished:
             lines.append(f"_latest:_ {_one_line(self.latest, 200)}")
         lines += [f":warning: {e}" for e in self.errors[-3:]]

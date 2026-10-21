@@ -324,6 +324,7 @@ async def run_headless(client, channel: str, thread_ts: str, entry: Optional[dic
     # A run still busy (adopted after a restart) keeps the thread, so two agents never answer at once.
     if previous and (_same_folder(previous.meta().get("cwd"), cwd) or previous.meta().get("status") == "running"):
         run, follow_up = previous, True
+        run.update_meta(**slack)
     else:
         # A new folder needs a fresh session (sessions are stored per folder); the prompt carries the thread.
         run = Run.create(engine, prompt, cwd, MODE, source="slack", extra=slack)
@@ -363,7 +364,7 @@ async def run_headless(client, channel: str, thread_ts: str, entry: Optional[dic
                 if not posted:
                     await reporter.finish("done", True)
                 if progress.final.strip() not in posted:
-                    await reporter.say(progress.final if not posted else ":hourglass: _Background work finished:_\n" + progress.final)
+                    await reporter.say(progress.final if not posted else ":arrows_counterclockwise: _Task update:_\n" + progress.final)
                     posted.append(progress.final.strip())
                     run.update_meta(slack_posted_seq=event.get("seq"))  # a restarted bot must not repeat it
                 ANSWERED.add(thread_ts)
@@ -921,6 +922,11 @@ def watch_checked(client, loop):
             return
         mention = f"<@{NOTIFY_USER}> " if NOTIFY_CHANNEL and NOTIFY_USER else ""
         if meta["status"] != "done":
+            from cos import reliability
+            delivery = reliability.status()
+            if (meta["status"] == "failed" and meta.get("source") == "schedule"
+                    and delivery.get("channel") and delivery.get("thread")):
+                return  # the receipt-aware reliability scheduler delivers this failure once
             earlier = [m for m in list_runs(300) if m.get("kind") == "watch" and m.get("watch_id") == watch["id"] and m["id"] < meta["id"]]
             if meta.get("source") != "schedule" or (earlier and earlier[0]["status"] != "done"):
                 return  # say it once, not every time it keeps failing
@@ -1280,7 +1286,8 @@ async def finish_adopted_slack_runs(client) -> list:
             turn = meta.get("turns") or 1
             posted_seq = meta.get("slack_posted_seq")
             posted: list[str] = []
-            if not pid_alive(meta.get("pid")) and _age_hours(meta.get("updated_at")) > 6:
+            if (not pid_alive(meta.get("pid")) and not pid_alive(meta.get("retry_owner"))
+                    and not Run.pending_valid(meta) and _age_hours(meta.get("updated_at")) > 6):
                 run.update_meta(status="failed", pid=None)  # long dead; the thread has moved on
                 return
             offset, last_text, dead_since = 0, "", None
@@ -1297,7 +1304,7 @@ async def finish_adopted_slack_runs(client) -> list:
                     except json.JSONDecodeError:
                         continue
                     body = (event.get("body") or "").strip()
-                    if event.get("turn") != turn or not body:
+                    if event.get("turn",0) < turn or not body:
                         continue
                     if event["kind"] == "text":
                         last_text = body
@@ -1305,11 +1312,12 @@ async def finish_adopted_slack_runs(client) -> list:
                         posted.append(body)  # the old bot already posted this one
                     elif event["kind"] == "result" and body not in posted:
                         await post_markdown(client, channel, thread,
-                                            body if not posted else ":hourglass: _Background work finished:_\n" + body)
+                                            body if not posted else ":arrows_counterclockwise: _Task update:_\n" + body)
                         posted.append(body)
+                        run.update_meta(slack_posted_seq=event.get("seq"))
                 if final["status"] != "running":
                     break
-                if pid_alive(final.get("pid")):
+                if pid_alive(final.get("pid")) or pid_alive(final.get("retry_owner")) or Run.pending_valid(final):
                     dead_since = None
                 elif dead_since is None:
                     dead_since = time.monotonic()
@@ -1318,6 +1326,10 @@ async def finish_adopted_slack_runs(client) -> list:
                     final = run.update_meta(status="done" if posted else "failed", pid=None)
                     break
                 await asyncio.sleep(_ADOPT_POLL_SECONDS)
+            if posted and final["status"] == "failed":
+                reason = (final.get("conclusion") or {}).get("line") or "Inspect the trace for the concrete blocker."
+                await post_markdown(client, channel, thread,
+                                    ":warning: " + reason + "\nStatus: blocked — task continuation stopped; see the trace.")
             if not posted:
                 text = last_text if final["status"] == "done" and last_text else f":warning: The run ended ({final['status']}). See the dashboard."
                 await post_markdown(client, channel, thread, text)

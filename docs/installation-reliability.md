@@ -1,0 +1,33 @@
+# Installation reliability register
+
+`COS_HOME/reliability.json` retains activation time, source commit, a frozen seven-day baseline, authorized Slack destination, and six improvement records: `continuity`, `release_scope`, `evidence`, `scheduled_jobs`, `approvals`, `communication`. Configuration is idempotent: changing delivery settings preserves activation and baseline. Updates use a process lock and atomic replacement.
+
+Configure after installing the intended commit (does not send Slack messages):
+
+```
+python -m cos.reliability configure --channel C0C8PAUC7DK --thread 1792548996.013219 --at 18:00 --tz Asia/Kolkata
+python -m cos.reliability status
+python -m cos.reliability report
+```
+
+The daily deterministic comparison runs inside chief, using the existing Slack client. It performs no model calls. Delivery targets the configured thread, observes notification pause, and records daily/watch IDs only after successful delivery. Failed sends retry the next minute. A restart preserves delivered IDs. Scheduled watch failures from the preceding seven days, after activation, are grouped into one message with up to twenty unseen run IDs per pass. Each incident includes its source timestamp; already acknowledged IDs are filtered before selecting the batch. Delivery requires Slack ok=true and a nonempty message timestamp. Reports themselves do not create runs or human prompts.
+
+The comparison uses event timestamps in half-open windows: baseline `[activation - exposure, activation)` and post `[activation, activation + exposure)`. Exposure is elapsed time since activation capped at seven days. The first week grows comparably. Thereafter post is the latest seven-day window, while baseline remains the fixed seven days before activation. The frozen full-week baseline remains available separately. All windows are epoch seconds; naive historical timestamps are assumed UTC. Daily delivery is explicitly Asia/Kolkata by default, not machine-local time.
+
+Metrics are descriptive proxies:
+
+- `abandoned_waiting_exits`: a terminal Slack run whose latest in-window waiting result is at least fifteen minutes old at cohort end, with no subsequent in-window prompt, recovery marker or result; no live process/retry owner or pending continuation; current conclusion absent or waiting. Partial/oversized event scans are excluded. This is a stranded-work proxy: historical process ownership cannot be reconstructed, and out-of-window continuations can affect interpretation.
+- `manual_status_nudges`: Slack prompt events mentioning status/update/progress/continue/still working/what happened, after stripping everything through the final owner-message context marker. Exact synthetic `continue` and known waiting-continuation prompts are excluded. Unmarked remaining Slack prompts are assumed human. This heuristic can misclassify intent.
+- `automatic_recoveries`: status events with `waiting_continuation`, `auto_restart` or `continuation_recovered` data; auto_restart must be a positive integer, so exhausted notices do not count. These count recovery attempts/restorations, not proven successful task completion.
+- `completion_refusals`: events with exact `data.completion_refused` marker.
+- `evidence_refusals`: timestamped loop PR/runtime proof refusals from the bounded tail of `evidence-refusals.jsonl`, separate from task completion refusals.
+- `declared_contracts`: runs with valid goal/steps in `task.json`, assigned by contract creation epoch timestamp rather than reused Slack-thread run creation time. Legacy empty contracts or missing contract timestamps use parent run creation time; this is contract coverage, not proof of correctness.
+- `scheduled_watch_runs`: terminal (done/failed/cancelled) scheduled watch runs in the window, the denominator for failure rate (null when no samples).
+- `scheduled_watch_failures`: watch metadata with source `schedule` and terminal `failed`, using updated_at (fallback created_at), once per run.
+- `progress_replies` / `final_replies`: Slack run text / result events; these count generated output, not Slack delivery acknowledgments or quality.
+
+Every report includes run/event sample counts. Fewer than ten sampled runs in either window produces `insufficient data`; larger samples remain descriptive and establish no causality. Release scope, evidence correctness and approval appropriateness require review beyond these counters; no invented numerical effectiveness score is assigned to them.
+
+Reads retain at most the newest 2,000 run directories by ID, 64 KiB metadata per run, and 2 MB events per run, with a 32 MB total run-event scan budget per cohort plus a 2 MB bounded tail of loop evidence refusals. Event lines over 64 KiB are discarded in bounded chunks; tool bodies are never included in measurement. Reports expose oversized-line, truncated-file and run-cap counts in JSON. Bounds and missing/malformed logs can undercount history. The sent ledger retains the newest 2,000 acknowledgments; scheduling scans a bounded seven-day failure window.
+
+Installation authorization covers this reliability installation, not arbitrary product deployments. Continue already authorized work from persistent checkpoints, retain exact release pins, require source-backed proof, surface real blockers, and keep progress concise. Preserve these rules in the installed operating prompt and durable task contracts.

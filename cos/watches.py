@@ -1,9 +1,9 @@
 """Watches: standing jobs that look at something on a schedule (Sentry, production logs, CI) and
 report what they found as findings you can act on.
 
-A watch is a headless Claude run that can only read: its tools are limited to READ_ONLY_TOOLS by
-Claude's own permission system (--allowedTools; anything else is refused), and it answers in a
-fixed JSON shape (--json-schema), so findings are data rather than prose to scrape. Each check is
+A watch is a headless Claude or Codex run that can only read. Claude uses a tool allowlist;
+Codex uses a network-isolated read-only sandbox and a trusted GitHub snapshot collector.
+Both answer in a fixed JSON shape, so findings are data rather than prose to scrape. Each check is
 an ordinary run (kind "watch") and shows in History with every step it took.
 
 Files in COS_HOME: watches.json (what to watch), findings.json (what was found, by id).
@@ -17,6 +17,7 @@ import logging
 import os
 import re
 import threading
+import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable, Optional
@@ -197,6 +198,15 @@ def save(data: dict) -> dict:
         raise ValueError("at must be between 08:00 and 20:00 for a work-hours watch")
     fields = {"name": name, "instructions": instructions, "every": every, "hours": hours,
               "enabled": bool(data.get("enabled", True))}
+    if "engine" in data:
+        if data["engine"] not in ("claude", "codex"):
+            raise ValueError("engine must be claude or codex")
+        fields["engine"] = data["engine"]
+    if "issue_repo" in data:
+        repo = str(data["issue_repo"]).strip()
+        if repo and not re.fullmatch(r"[\w.-]+/[\w.-]+", repo):
+            raise ValueError("issue_repo must be owner/repo")
+        fields["issue_repo"] = repo
     if "at" in data:
         fields["at"] = at
     with _lock:
@@ -286,8 +296,22 @@ def _since(watch: dict) -> str:
     return f"{last[:16].replace('T', ' ')} local time, about {minutes} minutes ago (use a window of {minutes}m)"
 
 
+def in_scope(watch: dict, finding: dict) -> bool:
+    """Scoped watches only retain findings explicitly attributed to their issue repo."""
+    repo = watch.get("issue_repo")
+    if not repo:
+        return True
+    if str(finding.get("repo", "")).lower() != repo.lower():
+        return False
+    link = str(finding.get("link", ""))
+    if str(finding.get("key", "")).startswith("daily-update:"):
+        link += " " + str(finding.get("what", ""))
+    issues = re.findall(r"https://github\.com/([^/]+/[^/]+)/issues/\d+", link, re.IGNORECASE)
+    return all(source.lower() == repo.lower() for source in issues)
+
+
 def prompt(watch: dict) -> str:
-    known = [f for f in _findings().values() if f["watch_id"] == watch["id"]]
+    known = [f for f in _findings().values() if f["watch_id"] == watch["id"] and in_scope(watch, f)]
     known.sort(key=lambda f: f["last_seen"], reverse=True)
     lines = [f"- {f['key']}: {f['title']} ({'dismissed by me' if f['status'] == 'dismissed' else 'already reported'})"
              for f in known[:40]]
@@ -296,6 +320,11 @@ def prompt(watch: dict) -> str:
         "",
         "What to watch:",
         watch["instructions"],
+        (f"Issue scope: {watch['issue_repo']} ONLY. List issues with gh issue list --repo {watch['issue_repo']} "
+         "--label bug --state open. Filter project items to that repository before triage. "
+         "Do not triage issues from any other repo. Other repos may be read only as evidence for a scoped "
+         "issue's fix or deployment. Set repo to the issue repository on every finding, including daily drafts. "
+         "Every issue in the draft must belong to this repository." if watch.get("issue_repo") else ""),
         "",
         f"Now: {datetime.now().strftime('%Y-%m-%d %H:%M')} local time. Last check: {_since(watch)}.",
         "",
@@ -305,8 +334,11 @@ def prompt(watch: dict) -> str:
         "",
         "Rules:",
         "- Read only. Do not change anything anywhere: no resolving, assigning, commenting, deploying or pushing.",
-        "- Shell: one command per Bash call, no `cd` (use absolute paths or --project flags), and the Read "
-        "tool instead of cat/head/sed on files. A refused command costs a turn you may not get back.",
+        ("- Use shell/Python to read the local GitHub snapshot and absolute paths for local git history. "
+         "The snapshot replaces all network lookups; do not attempt external calls."
+         if watch.get("engine") == "codex" else
+         "- Shell: one command per Bash call, no `cd` (use absolute paths or --project flags), and the Read "
+         "tool instead of cat/head/sed on files. A refused command costs a turn you may not get back."),
         "- Report problems that need an engineer, not noise. One finding per distinct problem; group repeats.",
         "- severity: high = users affected now or data at risk; medium = a real bug with limited impact; low = worth knowing.",
         "- key: stable across checks (a Sentry short id, or service:error-signature).",
@@ -316,8 +348,18 @@ def prompt(watch: dict) -> str:
     ])
 
 
-def cli_args() -> tuple[list[str], list[str]]:
+def cli_args(engine: str = "claude") -> tuple[list[str], list[str]]:
     """(every turn, first turn only): tools limited to reading; the answer in the findings shape."""
+    if engine == "codex":
+        from .controller import _DISABLED
+        # Leave shell/file reads available, but no connectors, browser, hooks, or child agents.
+        disabled = [f for f in _DISABLED if f not in ("shell_tool", "unified_exec", "view_image", "code_mode", "code_mode_host")]
+        args = ["--ignore-user-config", "--ignore-rules", "-c", 'approval_policy="never"',
+                "-c", 'web_search="disabled"', "-c", "project_doc_max_bytes=0",
+                "-c", "skills.bundled.enabled=false", "--enable", "skip_host_skill_discovery"]
+        for feature in disabled:
+            args += ["--disable", feature]
+        return args, []  # Schema path is unique to the run and written by start().
     extra = [t.strip() for t in os.environ.get("NEO_WATCH_TOOLS", "").split(",") if t.strip()]
     every_turn = ["--allowedTools", ",".join(READ_ONLY_TOOLS + extra), "--disallowedTools", ",".join(DENIED_TOOLS)]
     return every_turn, ["--json-schema", json.dumps(FINDINGS_SCHEMA)]
@@ -332,14 +374,39 @@ def start(watch_id: str, source: str = "schedule") -> dict:
         current = running(watch_id)
         if current:
             return current
-        every_turn, first_turn = cli_args()
-        run = Run.create("claude", prompt(watch), workdir(), "readonly", source=source,
+        engine = watch.get("engine", "claude")
+        every_turn, first_turn = cli_args(engine)
+        run = Run.create(engine, prompt(watch), workdir(), "readonly", source=source,
                          extra={"kind": "watch", "watch_id": watch_id, "title": f"Watch: {watch['name']}",
                                 "cli_args": every_turn, "first_turn_args": first_turn})
+        if engine == "codex":
+            from .controller import _strict_schema
+            schema_path = run.dir / "findings-schema.json"
+            schema_path.write_text(json.dumps(_strict_schema(FINDINGS_SCHEMA)))
+            run.update_meta(first_turn_args=["--output-schema", str(schema_path)])
         _update(watch_id, last_started_at=datetime.now().isoformat(timespec="seconds"), last_run_id=run.id)
 
     def work():
         try:
+            if engine == "codex":
+                if not watch.get("issue_repo"):
+                    raise ValueError("Codex issue watches require issue_repo for a read-only snapshot")
+                from .watch_snapshot import collect
+                snapshot = collect(watch["issue_repo"])
+                isolated = Path(tempfile.mkdtemp(prefix="neo-watch-" + run.id + "-"))
+                (isolated / "github-snapshot.json").write_text(json.dumps(snapshot))
+                instructions = (
+                    "\n\nGitHub evidence has already been fetched by the trusted read-only collector. "
+                    "Read github-snapshot.json in the current directory using python3. Inspect counts and a compact "
+                    "title index first, then selected issue bodies/comments; do not dump the entire large snapshot. "
+                    "It contains ALL open bug issues "
+                    "in the scoped repo, complete comments, cross-referenced PRs and available project/deploy metadata. "
+                    "The snapshot uses GitHub GraphQL connection objects (nodes). Network is deliberately blocked; "
+                    "do not run gh, curl or try to enable network. You may read local repo history using absolute paths. "
+                    "Report source_errors explicitly in your summary. Do not claim deployment facts that the snapshot "
+                    "and local history cannot establish. Return findings in the required JSON schema."
+                )
+                run.update_meta(cwd=str(isolated), prompt=run.meta()["prompt"] + instructions)
             run.execute()
         except Exception as exc:  # noqa: BLE001 - recorded in the run
             run.append_event({"kind": "error", "title": "Watch failed", "body": repr(exc), "data": {}}, 1)
@@ -368,13 +435,20 @@ def parse_result(run: Run) -> Optional[dict]:
     try:
         with (run.dir / "raw.jsonl").open() as fh:
             for line in fh:
-                if '"structured_output"' not in line and '"result"' not in line:
-                    continue
                 try:
                     raw = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if isinstance(raw, dict) and raw.get("type") == "result":
+                if not isinstance(raw, dict):
+                    continue
+                if raw.get("type") == "item.completed" and (raw.get("item") or {}).get("type") == "agent_message":
+                    try:
+                        candidate = json.loads(raw["item"].get("text", ""))
+                        if isinstance(candidate, dict) and isinstance(candidate.get("findings"), list):
+                            answer = candidate
+                    except (ValueError, TypeError):
+                        pass
+                if raw.get("type") == "result":
                     answer = raw.get("structured_output") or answer
                     if answer is None and isinstance(raw.get("result"), str):
                         text = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw["result"].strip())
@@ -413,7 +487,7 @@ def finish(watch: dict, run: Run, started: str) -> list[dict]:
         store = _findings()
         now = now_iso()
         for item in answer["findings"]:
-            if not isinstance(item, dict) or not str(item.get("key", "")).strip():
+            if not isinstance(item, dict) or not str(item.get("key", "")).strip() or not in_scope(watch, item):
                 continue
             fid = finding_id(watch["id"], str(item["key"]))
             fields = {k: str(item.get(k) or "")[:4000] for k in ("title", "what", "evidence", "link", "repo", "next_step")}

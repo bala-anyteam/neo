@@ -47,6 +47,25 @@ class ReliabilityTests(unittest.TestCase):
         again = reliability.configure('C1', '1.2', now=self.now, commit='def')
         self.assertEqual(again['activation_commit'], 'abc')
 
+    def test_watch_failure_notice_contains_cause_action_and_trace(self):
+        from datetime import timedelta
+        reliability.configure('C1','1.2',at='23:59',now=self.now,commit='abc')
+        self.run_data('20261021-160230-8cff60', {
+            'kind':'watch','source':'schedule','status':'failed','engine':'claude','turns':1,
+            'title':'Sentry','updated_at':(self.now+timedelta(seconds=60)).isoformat()}, [
+            {'turn':1,'kind':'result','body':"You've hit your weekly limit · resets Oct 23 at 6:30am (Asia/Calcutta)",
+             'ts':(self.now+timedelta(seconds=60)).isoformat()}])
+        client=type('Client',(),{})()
+        client.chat_postMessage=AsyncMock(return_value={'ok':True,'ts':'2.0'})
+        with patch('cos.reliability.pause.is_paused',return_value=False), \
+             patch.dict(os.environ,{'NEO_DASHBOARD_URL':'http://mini:8789'}):
+            asyncio.run(reliability.tick(client,now=self.now+timedelta(seconds=120)))
+        text=client.chat_postMessage.call_args.kwargs['text']
+        self.assertIn('weekly usage limit',text)
+        self.assertIn('Retry after reset',text)
+        self.assertIn('http://mini:8789/#20261021-160230-8cff60',text)
+        self.assertIn('not a confirmed product incident',text)
+
     def test_failed_send_retries_and_pause(self):
         reliability.configure('C1', '1.2', at='00:00', now=self.now, commit='abc')
         client = type('Client', (), {})()

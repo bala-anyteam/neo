@@ -65,3 +65,15 @@ new accepted owner requests and cancellation invalidate old queued summaries.
 Slack receipt is required before advancing the notification clock; failed delivery
 is retried by the scheduler. Internal execution continues on its separate schedule.
 Notification state is stored in each run's `task-updates.json`.
+
+## Failure explanations and busy follow-ups
+Scheduled failure notices include an allowlisted cause, next action and trace. They
+explicitly distinguish incomplete monitoring from a confirmed product incident.
+Only the current turn's recorded error/result tail is considered; unknown causes
+remain unknown rather than reflecting raw output or credentials into Slack.
+
+An already active task rejects a competing follow-up with a clear acknowledgment
+and trace, preserving its engine and notification timer. A typed runner rejection
+also handles the race after preflight without reporting task failure. This does not
+queue or steer the rejected instruction; the message explicitly says it was not
+started. Actual cancellation still requires the existing stop command.

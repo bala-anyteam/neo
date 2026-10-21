@@ -29,6 +29,10 @@ from typing import Callable, Optional
 from . import conclusion
 from .events import normalize
 
+class RunBusyError(RuntimeError):
+    """A competing caller did not acquire this run; the active turn is unchanged."""
+
+
 ENGINES = ("claude", "codex")
 MODES = ("readonly", "edit", "full")
 TERMINAL = ("done", "failed", "cancelled")
@@ -523,7 +527,7 @@ class Run:
             if retrying and (meta["status"] != "running" or meta.get("retry_owner") != os.getpid()):
                 return meta  # cancelled (or taken over) while we waited
             if meta["status"] == "running" and not retrying:
-                raise RuntimeError("run is already executing a turn")
+                raise RunBusyError("run is already executing a turn")
             if retrying and (self.dir / "task.json").exists():
                 from . import tasks
                 try:

@@ -12,7 +12,7 @@ import subprocess
 import threading
 from zoneinfo import ZoneInfo
 
-from . import pause
+from . import pause, failure_context
 from .config import OWNER_MESSAGE_MARK
 from .runner import cos_home, pid_alive
 
@@ -280,8 +280,9 @@ async def tick(client, now=None):
     unsent = [f for f in failures if 'watch:' + f['id'] not in data.get('sent', {})]
     batch = unsent[:20]
     if batch:
-        lines = [f"{f['title']} (run {f['id']}, timestamp {f['ts']})" for f in batch]
-        pending.append((['watch:' + f['id'] for f in batch], 'Scheduled watch failures — inspect these runs:\n' + '\n'.join(lines)))
+        lines = [f"• {f['title']}: {failure_context.safe_reason(cos_home() / 'runs' / f['id'])} "
+                 f"{failure_context.trace_link(cos_home() / 'runs' / f['id'])}" for f in batch]
+        pending.append((['watch:' + f['id'] for f in batch], 'Scheduled monitoring could not complete (not a confirmed product incident):\n' + '\n'.join(lines)))
     for keys, text in pending:
         if all(key in status().get('sent', {}) for key in keys):
             continue

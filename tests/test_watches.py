@@ -5,6 +5,7 @@ import os
 import stat
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from datetime import datetime
@@ -127,12 +128,17 @@ class WatchesTest(WatchTestCase):
 
     def test_check_records_findings_once_and_tells_the_bot(self):
         told = []
-        self.watches.on_checked = lambda watch, meta, new: told.append((watch["id"], meta["status"], [f["key"] for f in new]))
+        notified = threading.Event()
+        def on_checked(watch, meta, new):
+            told.append((watch["id"], meta["status"], [f["key"] for f in new]))
+            notified.set()
+        self.watches.on_checked = on_checked
         self.watches.start("sentry", "dashboard")
         meta = self.wait_for_check("sentry")
         self.assertEqual(meta["status"], "done")
         self.assertEqual((meta["watch_found"], meta["watch_new"]), (2, 2))
         self.assertEqual(meta["watch_summary"], "Two problems.")
+        self.assertTrue(notified.wait(5), "watch callback did not finish")
         self.assertEqual(told, [("sentry", "done", ["API-12", "worker:timeout"])])
         # Only reading tools, and Sentry's write tool refused.
         args = json.loads(Path(str(self.fake) + ".args").read_text())

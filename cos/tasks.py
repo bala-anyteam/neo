@@ -107,7 +107,7 @@ def check(run_id, step_id):
 def unmet(run_id):
     data = show(run_id)
     if data.get('block'):
-        return ['human gate: ' + data['block']]
+        return [block_label(data) + ': ' + data['block']]
     out = []
     for step in data.get('steps', []):
         for spec in step['proofs']:
@@ -151,11 +151,33 @@ def release(run_id, scope, approval=''):
     return show(run_id)
 
 
-def block(run_id, reason):
-    if not reason.strip():
-        raise ValueError('name the human and concrete gate')
+def block_state(data):
+    # Legacy untyped blocks remain human gates: never silently bypass an old approval.
+    return 'blocked' if data.get('block_details', {}).get('kind') in ('access', 'evidence') else 'needs-you'
+
+
+def block_label(data):
+    kind = data.get('block_details', {}).get('kind')
+    return kind + ' blocker' if kind in ('access', 'evidence') else 'human gate'
+
+
+def block_message(data):
+    if block_state(data) == 'needs-you':
+        return 'Task awaits the recorded approval.\nStatus: needs-you — ' + data['block']
+    return 'Task has a technical blocker.\nStatus: blocked — ' + data['block']
+
+
+def block(run_id, reason, kind=None, source='', approver='', decision=''):
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError('concrete blocker reason required')
+    if kind not in (None, 'human', 'access', 'evidence'):
+        raise ValueError('pending automated work must use waiting, not a permanent block')
+    if kind == 'human' and not all(isinstance(v, str) and v.strip() for v in (source, approver, decision)):
+        raise ValueError('human gate requires policy source, approver and exact decision')
     with _edit(run_id) as data:
         data['block'] = reason[:1000]
+        data['block_details'] = {'kind': kind or 'legacy-human', 'source': source[:1000],
+                                 'approver': approver[:200], 'decision': decision[:1000]}
     return show(run_id)
 
 
@@ -164,29 +186,49 @@ def unblock(run_id, approval):
         raise ValueError('owner approval text required')
     with _edit(run_id) as data:
         data.pop('block', None)
+        data.pop('block_details', None)
         data.setdefault('scope_approvals', []).append({'at':time.time(),'approval':approval[:1000]})
+    return show(run_id)
+
+
+def resolve(run_id, evidence):
+    if not isinstance(evidence, str) or not evidence.strip():
+        raise ValueError('technical resolution evidence required')
+    with _edit(run_id) as data:
+        if not data.get('block') or block_state(data) != 'blocked':
+            raise ValueError('only technical blockers can be resolved without human approval')
+        data.setdefault('block_resolutions', []).append({
+            'at': time.time(), 'reason': data.pop('block'),
+            'details': data.pop('block_details', {}), 'evidence': evidence[:1000]})
     return show(run_id)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='command', required=True)
-    for name in ('contract','check','show','release','block','unblock'):
+    for name in ('contract','check','show','release','block','unblock','resolve'):
         cmd = sub.add_parser(name)
         cmd.add_argument('--run', default=os.environ.get('NEO_RUN_ID'))
         if name == 'contract':
             cmd.add_argument('--goal', required=True)
             cmd.add_argument('--steps', required=True, type=json.loads)
+        if name == 'resolve': cmd.add_argument('--evidence', required=True)
         if name == 'check': cmd.add_argument('--step', required=True)
         if name == 'release': cmd.add_argument('--scope', required=True, type=json.loads)
-        if name == 'block': cmd.add_argument('--reason', required=True)
+        if name == 'block':
+            cmd.add_argument('--reason', required=True)
+            cmd.add_argument('--kind', choices=('human', 'access', 'evidence'), required=True)
+            cmd.add_argument('--source', default='')
+            cmd.add_argument('--approver', default='')
+            cmd.add_argument('--decision', default='')
         if name in ('contract','release','unblock'): cmd.add_argument('--approval', default='')
     args = parser.parse_args()
     try:
         if args.command == 'contract': result = contract(args.run,args.goal,args.steps,args.approval)
         elif args.command == 'check': result = check(args.run,args.step)
         elif args.command == 'release': result = release(args.run,args.scope,args.approval)
-        elif args.command == 'block': result = block(args.run,args.reason)
+        elif args.command == 'block': result = block(args.run,args.reason,args.kind,args.source,args.approver,args.decision)
+        elif args.command == 'resolve': result = resolve(args.run,args.evidence)
         elif args.command == 'unblock': result = unblock(args.run,args.approval)
         else: result = {**show(args.run), 'unmet': unmet(args.run)}
         print(json.dumps(result, indent=2))

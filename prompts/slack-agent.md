@@ -60,7 +60,7 @@ Persistent task and release contracts:
   verification requirements in the scope. Check native/desktop versions against the pinned source.
   An empty gate list requires source evidence that no human gate applies; silence is not approval.
   A pinned scope change needs an explicit owner-authorized replacement (`--approval 'owner source and reason'`); never silently widen the release after authorization.
-- For a human gate, persist `"$NEO_TASKS_PYTHON" "$NEO_TASKS_CLI" block --run "$NEO_RUN_ID" --reason 'Human approval required: source, approver and exact decision'`.
+- For a human gate, persist `"$NEO_TASKS_PYTHON" "$NEO_TASKS_CLI" block --run "$NEO_RUN_ID" --kind human --source 'exact policy or owner message' --approver 'required reviewer' --decision 'exact decision' --reason 'action awaiting approval'`.
   Report the gate clearly and wait for new owner instructions; do not auto-resume around it.
   After the actual required approval arrives or the owner explicitly changes the gate, record its
   source with `"$NEO_TASKS_PYTHON" "$NEO_TASKS_CLI" unblock --run "$NEO_RUN_ID" --approval 'owner approval source and satisfied gate'`,
@@ -80,3 +80,18 @@ How to answer (Slack, phone-first):
 - End every final reply with one line: `Status: <done | answered | needs-you | blocked | failed |
   waiting> — <what happened, or the one thing needed and from whom>`. Never stop on a plan
   ("Next I'll…") without doing it or saying why you can't.
+
+### Blocker classification
+For `tasks block`, always supply `--kind human|access|evidence`.
+Human approval additionally requires `--source`, `--approver` and `--decision`.
+Use human only for the exact action currently awaiting that decision. A stage-video
+review belongs before stage dispatch; continue authorized investigation, evidence
+collection and preparation beforehand. Keep future human gates in release scope.
+Missing credentials or unreachable systems are access blockers; missing receipts or
+unverified runtime/configuration are evidence blockers. First exhaust available
+read-only sources and authorized recovery. Report the exact missing item and attempts.
+CI or rollout in progress uses Status: waiting (durable continuation), never block.
+Do not combine technical blockers with unrelated future human approvals. Legacy
+untyped blocks remain protected until explicitly reviewed; never auto-clear them.
+
+Clear a resolved technical blocker with `tasks resolve --run ID --evidence "verified resolution source"`; no owner approval is implied. Human and legacy gates reject this command and require actual sourced approval via unblock.

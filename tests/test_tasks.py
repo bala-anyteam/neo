@@ -56,6 +56,40 @@ class TaskContractTest(unittest.TestCase):
         self.assertEqual(tasks.show(self.run.id)['block'], 'Bala must review stage video')
         self.assertIn('Bala', tasks.unmet(self.run.id)[0])
 
+    def test_technical_block_is_not_reported_as_approval(self):
+        from cos import tasks
+        tasks.block(self.run.id, 'Provider evidence unavailable', kind='evidence')
+        self.assertEqual(tasks.block_state(tasks.show(self.run.id)), 'blocked')
+        self.assertEqual(tasks.unmet(self.run.id), ['evidence blocker: Provider evidence unavailable'])
+        text = self.run._guard_task_claim('Status: done — done', lambda e: None, 1)
+        self.assertIn('Status: blocked', text)
+        self.assertNotIn('approval', text)
+        text = self.run._guard_task_claim('Status: needs-you — awaiting approval', lambda e: None, 1)
+        self.assertIn('Status: blocked', text)
+
+    def test_human_gate_requires_source_approver_and_decision(self):
+        from cos import tasks
+        with self.assertRaises(ValueError):
+            tasks.block(self.run.id, 'Missing receipt', kind='human')
+        tasks.block(self.run.id, 'Stage video review', kind='human',
+                    source='owner standing instruction', approver='Bala', decision='Approve stage video')
+        self.assertEqual(tasks.block_state(tasks.show(self.run.id)), 'needs-you')
+
+    def test_technical_resolution_does_not_require_owner_approval(self):
+        from cos import tasks
+        tasks.block(self.run.id, 'Receipt unavailable', kind='evidence')
+        tasks.resolve(self.run.id, 'Verified receipt at canonical workflow URL')
+        self.assertNotIn('block', tasks.show(self.run.id))
+        tasks.block(self.run.id, 'Stage review needed')
+        with self.assertRaises(ValueError):
+            tasks.resolve(self.run.id, 'workflow passed')
+        self.assertIn('block', tasks.show(self.run.id))
+
+    def test_pending_work_cannot_be_a_permanent_block(self):
+        from cos import tasks
+        with self.assertRaises(ValueError):
+            tasks.block(self.run.id, 'CI running', kind='pending')
+
     def test_steps_without_evidence_are_rejected(self):
         from cos import tasks
         with self.assertRaises(ValueError):

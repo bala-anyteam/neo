@@ -410,14 +410,16 @@ class Run:
                 return None
             from . import tasks
             try:
-                gate = tasks.show(self.id).get("block")
+                task = tasks.show(self.id)
+                gate = task.get("block")
             except (OSError,ValueError):
                 gate = "task contract is unreadable; inspect it before resuming"
+                task = {"block": gate, "block_details": {"kind": "evidence"}}
             if gate:
                 final = self.update_meta(status="done",retry_owner=None,continuation=None,
-                                         conclusion={"state":"needs-you","line":gate})
-                emit(self.append_event({"kind":"result","title":"Human approval required",
-                                        "body":"Status: needs-you — " + gate,"data":{}},meta["turns"]))
+                                         conclusion={"state":tasks.block_state(task),"line":gate})
+                emit(self.append_event({"kind":"result","title":tasks.block_label(task),
+                                        "body":tasks.block_message(task),"data":{}},meta["turns"]))
                 return final
             self.update_meta(retry_owner=os.getpid(), api_retry_offset=pending.get("attempt", 0)
                              if pending["kind"] == "api" else 0)
@@ -434,12 +436,14 @@ class Run:
     def _guard_task_claim(self, text, emit, turn):
         from . import tasks
         state = (conclusion.status_of(text) or {}).get("state")
-        if state in ("needs-you", "blocked", "failed") or not (self.dir / "task.json").exists():
+        if not (self.dir / "task.json").exists():
             return text
         try:
             task = tasks.show(self.id)
             if task.get("block"):
-                return "Task awaits the recorded approval.\nStatus: needs-you — " + task["block"]
+                return tasks.block_message(task)
+            if state in ("needs-you", "blocked", "failed"):
+                return text
             if task.get("status") == "completed":
                 return text
             if state == "waiting":
@@ -520,16 +524,17 @@ class Run:
             if retrying and (self.dir / "task.json").exists():
                 from . import tasks
                 try:
-                    gate = tasks.show(self.id).get("block")
+                    task = tasks.show(self.id)
+                    gate = task.get("block")
                 except (OSError,ValueError):
                     return self.update_meta(status="failed",pid=None,retry_owner=None,continuation=None,
                                             conclusion={"state":"blocked","line":"Task contract is unreadable"})
                 if gate:
                     final = self.update_meta(status="done",pid=None,retry_owner=None,continuation=None,
-                                             conclusion={"state":"needs-you","line":gate})
+                                             conclusion={"state":tasks.block_state(task),"line":gate})
                     if on_event:
-                        on_event(self.append_event({"kind":"result","title":"Human approval required",
-                                                    "body":"Status: needs-you — " + gate,"data":{}},meta["turns"]))
+                        on_event(self.append_event({"kind":"result","title":tasks.block_label(task),
+                                                    "body":tasks.block_message(task),"data":{}},meta["turns"]))
                     return final
             is_follow_up = prompt is not None
             if is_follow_up and not meta.get("session_id"):

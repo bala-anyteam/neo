@@ -10,6 +10,7 @@ Layout per run (under COS_HOME/runs/<run_id>/):
 from __future__ import annotations
 
 import json
+import hashlib
 import fcntl
 import math
 import sys
@@ -545,7 +546,11 @@ class Run:
         emit = on_event or (lambda _e: None)
         try:
             system = "\n\n".join(filter(None, (meta.get("system_prompt"), run_context(meta)))) or None
-            cmd = build_command(engine, text, mode, meta["session_id"] if is_follow_up else None,
+            brief_digest = hashlib.sha256((system or "").encode()).hexdigest()
+            command_text = text
+            if engine == "codex" and is_follow_up and system and meta.get("brief_digest") != brief_digest:
+                command_text = f"Updated standing instructions and owner memory:\n{system}\n\n---\n\n{text}"
+            cmd = build_command(engine, command_text, mode, meta["session_id"] if is_follow_up else None,
                                 system=system, conclude=bool(meta.get("conclude")),
                                 extra_args=(meta.get("cli_args") or [])
                                 + (meta.get("first_turn_args") or [] if keep_first_turn_args or not is_follow_up else []))
@@ -569,7 +574,10 @@ class Run:
                          turn_started_at=time.time())
         if self._cancelled:  # stop requested while we were starting
             self._kill(self._proc.pid)
-        return self._follow(emit, turn, engine, offset, meta.get("cost_usd") or 0.0, time.time(), proc=self._proc)
+        final = self._follow(emit, turn, engine, offset, meta.get("cost_usd") or 0.0, time.time(), proc=self._proc)
+        if final.get("status") == "done":
+            self.update_meta(brief_digest=brief_digest)
+        return final
 
     def _follow(self, emit, turn: int, engine: str, offset: int, cost: float, started: float,
                 proc: Optional[subprocess.Popen] = None, pid: Optional[int] = None) -> dict:

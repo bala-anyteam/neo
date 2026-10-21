@@ -324,6 +324,7 @@ async def run_headless(client, channel: str, thread_ts: str, entry: Optional[dic
     # A run still busy (adopted after a restart) keeps the thread, so two agents never answer at once.
     if previous and (_same_folder(previous.meta().get("cwd"), cwd) or previous.meta().get("status") == "running"):
         run, follow_up = previous, True
+        run.update_meta(**slack)
     else:
         # A new folder needs a fresh session (sessions are stored per folder); the prompt carries the thread.
         run = Run.create(engine, prompt, cwd, MODE, source="slack", extra=slack)

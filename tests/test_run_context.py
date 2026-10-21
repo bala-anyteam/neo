@@ -81,6 +81,15 @@ class RunContextTest(unittest.TestCase):
         _, system, _ = self.start_turn()
         self.assertIsNone(system)
 
+    def test_changed_brief_reaches_resumed_codex_once(self):
+        run, _, _ = self.start_turn(engine="codex", **self.SLACK)
+        run.update_meta(system_prompt="Updated owner authorization")
+        self.start_turn(follow_up="continue authorized work", run=run)
+        self.assertIn("Updated owner authorization", self.cmd[-1])
+        self.assertTrue(self.cmd[-1].endswith("continue authorized work"))
+        self.start_turn(follow_up="same instructions", run=run)
+        self.assertEqual(self.cmd[-1],"same instructions")
+
 
 if __name__ == "__main__":
     unittest.main()

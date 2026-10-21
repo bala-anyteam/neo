@@ -15,7 +15,8 @@ from cos import ask, cards, config, digest, loops, server  # noqa: E402
 class OwnerTest(unittest.TestCase):
     def setUp(self):
         self.env = patch.dict(os.environ, {"COS_HOME": tempfile.mkdtemp(), "NEO_OWNER_NAME": "",
-                                           "NEO_OWNER_PROFILE": "", "NEO_DEPLOY_REPO": ""})
+                                           "NEO_OWNER_PROFILE": "", "NEO_DEPLOY_REPO": "",
+                                           "NEO_CONTROLLER_ENGINE": "claude", "NEO_CONTROLLER_MODEL": ""})
         self.env.start()
 
     def tearDown(self):

@@ -19,12 +19,76 @@ class LoopsTest(unittest.TestCase):
         self.env.start()
         from cos import loops
         self.loops = loops
+        import subprocess
+        self.gh = patch("subprocess.run", return_value=subprocess.CompletedProcess([], 0, '{"state":"MERGED","mergedAt":"2026-10-21T00:00:00Z","mergeCommit":{"oid":"abc"}}', ''))
+        self.gh.start()
+        self.addCleanup(self.gh.stop)
+        self.health = patch("cos.proofs.urllib.request.urlopen")
+        response = self.health.start()
+        response.return_value.__enter__.return_value.read.return_value = b'{"version":"1"}'
+        self.addCleanup(self.health.stop)
 
     def tearDown(self):
         self.env.stop()
 
     def up(self, lid, stage, at, evidence="seen it", **kw):
+        if stage in ("merged", "deployed", "verified") and lid in self.loops.STORE.read():
+            self.loops.STORE.update(lambda rows: rows[lid]["links"].update(prs=rows[lid]["links"].get("prs") or ["https://github.com/o/r/pull/7"]))
+            kw.setdefault("links", {"prs": self.loops.STORE.read()[lid]["links"]["prs"]})
+            kw.setdefault("proof", {"kind": "health", "url": "https://service/health", "expected": {"version": "1"}})
         return self.loops.apply_update(lid, {"stage": stage, "note": kw.pop("note", ""), "evidence": evidence, **kw}, now=at)
+
+    def test_open_pr_cannot_be_claimed_merged(self):
+        l = self.loops.open_loop("pr", "pr:o/r#7", "t", {"prs": ["https://github.com/o/r/pull/7"]}, stage="fix_pr")
+        import subprocess
+        with patch("subprocess.run", return_value=subprocess.CompletedProcess([], 0, '{"state":"OPEN","mergedAt":null,"mergeCommit":null}', '')):
+            ok, _ = self.up(l["id"], "merged", T0, evidence="MERGED")
+        self.assertFalse(ok)
+
+    def test_canonical_pr_identity_cannot_be_replaced_by_model_link(self):
+        l = self.loops.open_loop("pr", "pr:o/r#7", "t", {"prs": ["https://github.com/o/r/pull/8"]}, stage="fix_pr")
+        ok, _ = self.loops.apply_update(l["id"], {"stage": "merged", "evidence": "PR 8 merged", "links": {"prs": ["https://github.com/o/r/pull/8"]}})
+        self.assertTrue(ok)
+        from cos import proofs
+        self.assertIn("https://github.com/o/r/pull/7", proofs.subprocess.run.call_args.args[0])
+
+    def test_workflow_proof_cannot_claim_runtime_deployment(self):
+        l = self.loops.open_loop("pr", "pr:o/r#7", "t", {}, stage="merged")
+        ok, why = self.loops.apply_update(l["id"], {"stage": "deployed", "evidence": "workflow success", "proof": {"kind": "workflow", "url": "https://github.com/o/r/actions/runs/1"}})
+        self.assertFalse(ok)
+        self.assertIn("health", why)
+
+    def test_superseded_alert_pr_does_not_block_selected_merged_fix(self):
+        old, fix = "https://github.com/o/r/pull/1", "https://github.com/o/r/pull/2"
+        l = self.loops.open_loop("alert", "k", "t", {"prs": [old, fix]}, stage="fix_pr")
+        with patch("cos.proofs.verify", side_effect=lambda spec: {"verified": spec["url"] == fix}):
+            self.assertTrue(self.loops.apply_update(l["id"], {"stage": "merged", "evidence": "replacement merged", "links": {"prs": [fix]}})[0])
+
+    def test_same_stage_close_does_not_require_live_deployment_proofs(self):
+        l = self.loops.open_loop("alert", "k", "t", {}, stage="deployed")
+        with patch("cos.proofs.verify", side_effect=AssertionError("no proof fetch for informational close")):
+            self.assertTrue(self.loops.apply_update(l["id"], {"stage": "deployed", "close": True, "evidence": "issue no longer applies"})[0])
+        self.assertEqual(self.loops.STORE.read()[l["id"]]["status"], "closed")
+
+    def test_forward_close_cannot_bypass_proofs(self):
+        l = self.loops.open_loop("alert", "k", "t", {}, stage="fix_pr")
+        self.assertFalse(self.loops.apply_update(l["id"], {"stage": "deployed", "close": True, "evidence": "claimed"})[0])
+
+    def test_refusal_ledger_contains_no_model_evidence(self):
+        l = self.loops.open_loop("alert", "k", "t", {}, stage="fix_pr")
+        self.loops.apply_update(l["id"], {"stage": "merged", "evidence": "secret-token"}, now=T0)
+        path = Path(os.environ["COS_HOME"]) / "evidence-refusals.jsonl"
+        self.assertTrue(path.exists())
+        row = json.loads(path.read_text())
+        self.assertEqual(row["loop_id"], l["id"])
+        self.assertIn("ts", row)
+        self.assertNotIn("secret-token", path.read_text())
+
+    def test_alert_progress_needs_explicit_linked_pr_selection(self):
+        linked = "https://github.com/o/r/pull/2"
+        l = self.loops.open_loop("alert", "k", "t", {"prs": [linked]}, stage="fix_pr")
+        for links in ({}, {"prs": ["https://github.com/o/r/pull/99"]}):
+            self.assertFalse(self.loops.apply_update(l["id"], {"stage": "merged", "evidence": "claimed", "links": links})[0])
 
     def test_open_is_idempotent_by_key(self):
         a = self.loops.open_loop("alert", "slack:C1:1.1", "HighErrorRate api", {"source": "u"}, now=T0)
@@ -138,7 +202,7 @@ class LoopsTest(unittest.TestCase):
     def test_finish_check_applies_structured_updates(self):
         from cos.runner import Run, runs_dir
         runs_dir()
-        l = self.loops.open_loop("pr", "pr:o/r#7", "fix: x", {"prs": ["u"]}, stage="fix_pr")
+        l = self.loops.open_loop("pr", "pr:o/r#7", "fix: x", {"prs": ["https://github.com/o/r/pull/7"]}, stage="fix_pr")
         run = Run.create("claude", "check", os.environ["COS_HOME"], "readonly", extra={"kind": "loops"})
         answer = {"updates": [{"id": l["id"], "stage": "merged", "note": "merged", "evidence": "gh pr view: MERGED"},
                               {"id": l["id"], "stage": "fix_pr", "note": "", "evidence": "x"}]}
@@ -202,6 +266,14 @@ class RcaFromRunTest(unittest.TestCase):
         self.env.start()
         from cos import loops
         self.loops = loops
+        import subprocess
+        self.gh = patch("subprocess.run", return_value=subprocess.CompletedProcess([], 0, '{"state":"MERGED","mergedAt":"2026-10-21T00:00:00Z","mergeCommit":{"oid":"abc"}}', ''))
+        self.gh.start()
+        self.addCleanup(self.gh.stop)
+        self.health = patch("cos.proofs.urllib.request.urlopen")
+        response = self.health.start()
+        response.return_value.__enter__.return_value.read.return_value = b'{"version":"1"}'
+        self.addCleanup(self.health.stop)
 
     def tearDown(self):
         self.env.stop()

@@ -22,8 +22,9 @@ import threading
 import time
 from typing import Callable, Optional
 
+from . import proofs
 from .config import owner_fields, workdir
-from .runner import Run, list_runs, pid_alive
+from .runner import Run, cos_home, list_runs, pid_alive
 from .store import JsonStore
 
 STORE = JsonStore("loops.json")
@@ -103,6 +104,26 @@ def apply_update(loop_id: str, update: dict, now: Optional[float] = None) -> tup
                 return False, "verified needs deployed first"
             if now - loop["stage_at"] < VERIFY_QUIET_HOURS * 3600:
                 return False, f"verified needs {VERIFY_QUIET_HOURS}h quiet after deploy"
+        if new >= STAGES.index("merged") and not (new == old and update.get("close")):
+            # A PR loop's immutable key wins over newly supplied links or model prose.
+            known = {proofs.pr_identity(u) for u in loop.get("links", {}).get("prs", [])}
+            selected = (update.get("links") or {}).get("prs", [])
+            urls = [proofs.pr_identity(u) for u in selected] if isinstance(selected, list) else []
+            if not urls or any(not u or u not in known for u in urls):
+                urls = []
+            if loop.get("kind") == "pr":
+                import re
+                identity = re.fullmatch(r"pr:([^/#]+/[^/#]+)#([1-9][0-9]*)", loop.get("key", ""))
+                urls = [f"https://github.com/{identity[1]}/pull/{identity[2]}"] if identity else []
+            urls = [u for u in urls if proofs.pr_identity(u)]
+            if not urls or not all(proofs.verify({"kind": "pr", "url": u})["verified"] for u in urls):
+                return False, "merged PR proof required"
+            if new >= STAGES.index("deployed"):
+                health = update.get("proof")
+                if not isinstance(health, dict) or health.get("kind") != "health" or not isinstance(health.get("expected"), dict) or not health["expected"].get("version"):
+                    return False, "exact-version runtime health proof required"
+                if not proofs.verify(health)["verified"]:
+                    return False, "runtime health proof failed"
         for k, v in (update.get("links") or {}).items():
             if k == "prs" and isinstance(v, list):
                 loop["links"]["prs"] = list(dict.fromkeys(loop["links"].get("prs", []) + [u for u in v if _web(u)]))
@@ -124,7 +145,19 @@ def apply_update(loop_id: str, update: dict, now: Optional[float] = None) -> tup
             loop["history"] = loop["history"][-50:]
         loop["updated_at"] = now
         return True, "ok"
-    return STORE.update(write)
+    outcome = STORE.update(write)
+    if not outcome[0] and outcome[1] in ("merged PR proof required", "exact-version runtime health proof required", "runtime health proof failed"):
+        # A bounded-size atomic append contains no source URLs, model evidence or secrets.
+        from datetime import datetime, timezone
+        row = {"ts": datetime.fromtimestamp(now, timezone.utc).isoformat(), "loop_id": loop_id, "reason": outcome[1]}
+        path = cos_home() / "evidence-refusals.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        try:
+            os.write(fd, (json.dumps(row) + "\n").encode())
+        finally:
+            os.close(fd)
+    return outcome
 
 
 def _same_title(a: str, b: str) -> bool:
@@ -215,7 +248,8 @@ UPDATE_SCHEMA = {
                        "close": {"type": "boolean", "description": "True when the PR was closed without merging or the issue no longer applies."},
                        "note": {"type": "string", "description": "One short line for the owner: what changed."},
                        "evidence": {"type": "string", "description": "What you looked at and what you saw (command and result, or link)."},
-                       "links": {"type": "object", "description": "prs (list of URLs), rca, rca_doc, deploy, sentry (URLs) you found."}}}}},
+                       "proof": {"type": "object", "description": "Read-only health proof: kind=health, url, expected JSON fields including exact version. Required for deployed/verified; workflow success is insufficient."},
+                       "links": {"type": "object", "description": "prs (list of URLs), rca, rca_doc, deploy, sentry (URLs) you found. For alert merged/deployed/verified select the current fix PR(s) from existing linked PRs; omit superseded PRs."}}}}},
 }
 CHECK_PROMPT = """You follow up on open issues and pull requests for {owner}. For each loop below, find out where it
 really is now. Report only loops whose stage changed, that regressed, or where you found a new link.
@@ -223,7 +257,8 @@ Stages, in order: {stages}.
 How to check (read only, change nothing anywhere):
 - PRs: `gh pr view <url> --json state,mergedAt,mergeCommit,title,body`. A closed, unmerged PR is not progress.
 - Deployed: the merge commit reached production. {deploy} Say "deployed" only with the
-  deploy run or image as evidence.
+  deploy run or image as evidence. Supply proof={{"kind":"health","url":"https://...","expected":{{"version":"exact version"}}}}
+  with an actual runtime endpoint and exact expected version; workflow success alone is insufficient.
 - Verified: after the deploy, the alert has not fired again and the Sentry issue (links.sentry) has no new events
   for {quiet}h. If it fired again or has new events after the deploy, set regressed=true and stage "rca".
 - RCA: an RCA reply in the alert's Slack thread (links.source). RCA doc: a Google Doc or Slack canvas linked from

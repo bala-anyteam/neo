@@ -11,7 +11,7 @@ import time
 from datetime import datetime
 from typing import Optional
 
-from cos import cards, digest, fleet, home, loops, mentions, pause, urgent, work
+from cos import cards, digest, fleet, home, loops, mentions, pause, reliability, urgent, work
 from cos.store import JsonStore
 
 log = logging.getLogger("neo")
@@ -167,9 +167,19 @@ async def digest_scheduler(client, where: str, mention: str, base_url: Optional[
         await asyncio.sleep(60)
 
 
+async def reliability_scheduler(client) -> None:
+    """Deterministic reports and failed-watch notices; failed sends retry next minute."""
+    while True:
+        try:
+            await reliability.tick(client)
+        except Exception:
+            log.exception("reliability notification failed")
+        await asyncio.sleep(60)
+
+
 def start(client, notify_channel: Optional[str], notify_user: Optional[str], base_url: Optional[str]) -> list:
     tasks = [asyncio.create_task(card_scheduler()), asyncio.create_task(loop_scheduler()),
-             asyncio.create_task(mention_scheduler())]
+             asyncio.create_task(mention_scheduler()), asyncio.create_task(reliability_scheduler(client))]
     where = notify_channel or notify_user
     if where:
         mention = f"<@{notify_user}> " if notify_channel and notify_user else ""

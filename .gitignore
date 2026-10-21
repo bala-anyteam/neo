@@ -25,6 +25,9 @@ usage.json
 settings.json
 watches.json
 auto_rca.json
+reliability.json
+reliability.lock
+evidence-refusals.jsonl
 *.tmp
 
 # Python

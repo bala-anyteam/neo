@@ -57,6 +57,7 @@ class CleanupTest(unittest.TestCase):
 
 
 class ProgressTest(unittest.TestCase):
+    @patch.dict(os.environ, {"NEO_PROGRESS_DEBUG": "1"})
     def test_render_steps_errors_and_link(self):
         p = commands.Progress("claude", "headless", "full", "20260929-120000-abcdef", "http://mini:8788")
         p.add({"kind": "tool_call", "title": "Bash", "body": "ls `-la`", "data": {}})
@@ -71,6 +72,7 @@ class ProgressTest(unittest.TestCase):
         self.assertIn("<http://mini:8788/#20260929-120000-abcdef|full trace>", out)
         self.assertEqual(p.final, "All good")
 
+    @patch.dict(os.environ, {"NEO_PROGRESS_DEBUG": "1"})
     def test_only_recent_steps_shown(self):
         p = commands.Progress("codex", "headless", "full", "20260929-120000-abcdef")
         for i in range(12):

@@ -39,6 +39,17 @@ AUTO_RESTART_DELAYS = (15.0, 60.0, 180.0)  # seconds before each attempt; its le
 # A live session's streak resets when the agent makes progress; this caps restarts between two
 # human prompts all the same, so an agent that always fails at the same point cannot loop forever.
 MAX_AUTO_RESTARTS_PER_PROMPT = 6
+# A successful process exit is not task completion when the agent says it is waiting.
+# Keep this separate from API retries, scoped to briefed Slack agents, and bounded.
+WAITING_CONTINUATION_DELAYS = (15.0, 60.0, 180.0)
+WAITING_CONTINUATION_PROMPT = (
+    "Your last turn ended with Status: waiting, but the requested task is unfinished. "
+    "Continue the already-authorized task from the recorded state. Inspect current checks and rollout "
+    "before acting; do not repeat a completed merge, release or deployment. Keep waiting/polling with "
+    "tools while work can proceed. Preserve all human approval gates, including stage-video review. "
+    "If a person must act, stop with Status: needs-you and name the person and exact action. "
+    "If you cannot proceed, use Status: blocked with the concrete reason. Do not expand scope."
+)
 _TRANSIENT_ERROR_RE = re.compile(
     r"connection lost|stopped arriving|overloaded|\b5\d\d\b|internal server error|bad gateway"
     r"|service unavailable|timed? ?out|econnreset|econnrefused|socket hang up|fetch failed"
@@ -288,13 +299,56 @@ class Run:
     # -------------------------------------------------------------- execution
 
     def execute(self, prompt: Optional[str] = None, on_event: Optional[Callable[[dict], None]] = None) -> dict:
+        final = self._execute_with_restarts(prompt, on_event)
+        return self._continue_waiting(final, on_event, attempts=0)
+
+    def _continue_waiting(self, final: dict, on_event=None, attempts: Optional[int] = None) -> dict:
+        """Continue clean waiting exits without conflating an engine turn with the user's task.
+
+        Adoption uses the persisted attempt count, so a bot restart cannot reset the cap.
+        Explicit human/blocked conclusions and non-Slack jobs are never continued.
+        """
+        emit = on_event or (lambda _e: None)
+        attempts = int(final.get("waiting_continuations") or 0) if attempts is None else attempts
+        while (final.get("status") == "done" and final.get("source") == "slack"
+               and final.get("conclude") and (final.get("conclusion") or {}).get("state") == "waiting"
+               and not self._cancelled):
+            if not final.get("session_id") or attempts >= len(WAITING_CONTINUATION_DELAYS):
+                with self._lock:
+                    current = self.meta()
+                    if current["status"] != "done" or current["turns"] != final["turns"]:
+                        return current
+                    message = "Unfinished task could not be continued; inspect the trace before resuming."
+                    emit(self.append_event({"kind": "error", "title": "Continuation limit reached",
+                                            "body": message, "data": {"attempts": attempts}}, final["turns"]))
+                    return self.update_meta(status="failed", retry_owner=None,
+                                            conclusion={"state": "blocked", "line": message})
+            delay = WAITING_CONTINUATION_DELAYS[attempts]
+            wake = _wake_event(self.id)
+            with self._lock:
+                current = self.meta()
+                if current["status"] != "done" or current["turns"] != final["turns"]:
+                    return current  # another caller cancelled or resumed it
+                wake.clear()
+                self.update_meta(status="running", pid=None, retry_owner=os.getpid(),
+                                 waiting_continuations=attempts + 1)
+            emit(self.append_event({"kind": "status", "title": "Continue unfinished task",
+                                    "body": f"Resuming in {delay:.0f}s ({attempts + 1}/{len(WAITING_CONTINUATION_DELAYS)})",
+                                    "data": {"waiting_continuation": attempts + 1}}, final["turns"]))
+            wake.wait(delay)
+            final = self._execute_with_restarts(WAITING_CONTINUATION_PROMPT, on_event, retrying=True)
+            attempts += 1
+        return final
+
+    def _execute_with_restarts(self, prompt: Optional[str] = None,
+                               on_event: Optional[Callable[[dict], None]] = None, retrying: bool = False) -> dict:
         """Run one turn to completion. Without a prompt, runs the initial prompt. A turn that ends
         on a transient engine error is resumed with "continue" (see AUTO_RESTART_DELAYS).
 
         While it waits the run stays "running" with no engine pid and retry_owner set to this
         process: callers keep treating it as busy, and if this process dies, fresh_meta() sees a
         dead owner and closes the run out as it does for any engine lost in a restart."""
-        final = self._execute_turn(prompt, on_event)
+        final = self._execute_turn(prompt, on_event, retrying=retrying)
         emit = on_event or (lambda _e: None)
         first_turn = prompt is None
         wake = _wake_event(self.id)
@@ -424,7 +478,7 @@ class Run:
                             data = event.get("data") or {}
                             if event["kind"] == "session" and data.get("session_id"):
                                 self.update_meta(session_id=data["session_id"])
-                            if event["kind"] == "text":
+                            if event["kind"] == "text" or (engine == "claude" and event["kind"] == "result"):
                                 last_text = event["body"]
                             if event["kind"] in ("result", "error") and "cost_usd" in data:
                                 saw_result = True
@@ -480,9 +534,10 @@ class Run:
         meta = self.meta()
         if meta.get("runtime", "headless") != "headless" or meta["status"] != "running" or not pid_alive(meta.get("pid")):
             return None
-        return self._follow(on_event or (lambda _e: None), meta.get("turns") or 1, meta["engine"],
+        final = self._follow(on_event or (lambda _e: None), meta.get("turns") or 1, meta["engine"],
                             int(meta.get("raw_offset") or 0), float(meta.get("cost_before_turn") or 0.0),
                             float(meta.get("turn_started_at") or time.time()), pid=meta["pid"])
+        return self._continue_waiting(final, on_event)
 
     @staticmethod
     def _kill(pid: int) -> bool:

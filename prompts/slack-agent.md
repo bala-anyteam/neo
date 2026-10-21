@@ -104,3 +104,5 @@ When the owner asks to stop automatic updates for a task, persist
 Use `--enabled true` when requested again. This mutes automatic background result
 messages, including completion/failure notices, without stopping internal work.
 Direct responses to a new owner message still appear. Never treat muting as cancel.
+
+Automatic task updates are delivered by Nio's durable notification scheduler: first after15 minutes from the accepted owner request, then every15 minutes while work remains active. Keep automatic results concise; do not send extra Slack task-update messages yourself or bypass this schedule. Direct replies to new owner messages remain immediate. Muting notifications does not stop internal continuation.

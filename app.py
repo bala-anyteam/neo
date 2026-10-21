@@ -39,7 +39,7 @@ import sessions  # noqa: E402
 from commands import Progress, clip, code_block  # noqa: E402
 from cos import brief as morning, fleet, pause, settings, watches  # noqa: E402
 from cos.alerts import AlertGate  # noqa: E402
-from cos import autonomy, learn  # noqa: E402
+from cos import autonomy, learn, task_updates  # noqa: E402
 from cos.config import controller_engine, controller_model, OWNER_MESSAGE_MARK, THREAD_CONTEXT_HEAD, agent_brief, default_engine, exit_with_parent, workdir  # noqa: E402
 from cos.herdr import Herdr, HerdrError  # noqa: E402
 from cos.interactive import InteractiveRun  # noqa: E402
@@ -332,6 +332,7 @@ async def run_headless(client, channel: str, thread_ts: str, entry: Optional[dic
             # Thread from before run tracking: resume its engine session.
             run.update_meta(session_id=entry["session_id"])
             follow_up = True
+    update_token = task_updates.begin(run.dir, direct=True)
     await sessions.set_thread(thread_ts, {"run_id": run.id, "engine": engine, "runtime": "headless", "cwd": pinned})
 
     progress = Progress(engine, "headless", run.meta()["mode"], run.id, DASHBOARD_URL)
@@ -357,20 +358,27 @@ async def run_headless(client, channel: str, thread_ts: str, entry: Optional[dic
             try:
                 event = await asyncio.wait_for(queue.get(), timeout=1.0)
             except asyncio.TimeoutError:
-                await reporter.update()
+                if not posted:
+                    await reporter.update()
                 continue
             progress.add(event)
             if event["kind"] == "result" and progress.final.strip():
+                if task_updates.current(run.dir) != update_token:
+                    continue  # old turn relinquished ownership to the owner's follow-up
                 if not posted:
                     await reporter.finish("done", True)
                 if progress.final.strip() not in posted:
-                    if not posted or run.meta().get("automatic_updates", True):
-                        await reporter.say(progress.final if not posted else ":arrows_counterclockwise: _Task update:_\n" + progress.final)
+                    if not posted:
+                        await reporter.say(progress.final)
+                        task_updates.answered(run.dir, update_token)
+                    # The first answer is direct; only waiting/ongoing work needs reminders.
+                    task_updates.queue(run.dir, progress.final, token=update_token, pending=bool(posted))
                     posted.append(progress.final.strip())
                     run.update_meta(slack_posted_seq=event.get("seq"))  # a restarted bot must not repeat it
                 ANSWERED.add(thread_ts)
                 continue
-            await reporter.update()
+            if not posted:
+                await reporter.update()
         meta = await task
     except Exception as exc:  # noqa: BLE001 - surface any failure back into Slack
         log.exception("headless run failed for thread=%s", thread_ts)
@@ -388,8 +396,12 @@ async def run_headless(client, channel: str, thread_ts: str, entry: Optional[dic
 
     status = meta.get("status", "failed")
     if posted:
-        if status not in ("done", "cancelled") and run.meta().get("automatic_updates", True):
-            await reporter.say(f":warning: Background work from this turn ended `{status}`. See the trace.")
+        if status == "cancelled":
+            # Handoff or explicit cancellation must not leak old queued results.
+            if task_updates.current(run.dir) == update_token:
+                task_updates.clear(run.dir)
+        elif status != "done":
+            task_updates.queue(run.dir, f":warning: Background work from this turn ended `{status}`. See the trace.", token=update_token)
         return status in ("done", "cancelled")
     answered = bool(progress.final.strip())
     await reporter.finish(status, answered)
@@ -1144,6 +1156,7 @@ async def _end_background(thread_ts: str, wait_seconds: float = 30.0) -> bool:
     process and wait for its turn to wind down. False if it would not stop in time."""
     run = HEADLESS.get(thread_ts)
     if run is not None:
+        task_updates.clear(run.dir)
         await asyncio.to_thread(run.cancel)
     deadline = time.monotonic() + wait_seconds
     while thread_ts in BUSY or thread_ts in HEADLESS:
@@ -1209,10 +1222,12 @@ async def handle_mention(event: dict, client) -> None:
         )
         return
     BUSY.add(thread_ts)  # no await between the check and this line
+    if entry and entry.get("run_id"):
+        task_updates.clear(Run(entry["run_id"]).dir)
     if stopped_background:
         await client.chat_postMessage(
             channel=channel, thread_ts=thread_ts,
-            text=":scissors: Stopped the background work left from the last answer to take this message.",
+            text="Taking your follow-up in the same task; the previous agent turn has stopped.",
         )
 
     await _react(client, channel, event["ts"], "eyes")
@@ -1287,6 +1302,7 @@ async def finish_adopted_slack_runs(client) -> list:
             turn = meta.get("turns") or 1
             posted_seq = meta.get("slack_posted_seq")
             posted: list[str] = []
+            update_token = task_updates.current(run.dir) or task_updates.begin(run.dir)
             if (not pid_alive(meta.get("pid")) and not pid_alive(meta.get("retry_owner"))
                     and not Run.pending_valid(meta) and _age_hours(meta.get("updated_at")) > 6):
                 run.update_meta(status="failed", pid=None)  # long dead; the thread has moved on
@@ -1312,9 +1328,11 @@ async def finish_adopted_slack_runs(client) -> list:
                     elif event["kind"] == "result" and posted_seq is not None and event.get("seq", -1) <= posted_seq:
                         posted.append(body)  # the old bot already posted this one
                     elif event["kind"] == "result" and body not in posted:
-                        if run.meta().get("automatic_updates", True):
-                            await post_markdown(client, channel, thread,
-                                                body if not posted else ":arrows_counterclockwise: _Task update:_\n" + body)
+                        first_direct = task_updates.direct_pending(run.dir, update_token)
+                        if first_direct:
+                            await post_markdown(client, channel, thread, body)
+                            task_updates.answered(run.dir, update_token)
+                        task_updates.queue(run.dir, body, token=update_token, pending=not first_direct)
                         posted.append(body)
                         run.update_meta(slack_posted_seq=event.get("seq"))
                 if final["status"] != "running":
@@ -1330,13 +1348,57 @@ async def finish_adopted_slack_runs(client) -> list:
                 await asyncio.sleep(_ADOPT_POLL_SECONDS)
             if posted and final["status"] == "failed" and run.meta().get("automatic_updates", True):
                 reason = (final.get("conclusion") or {}).get("line") or "Inspect the trace for the concrete blocker."
-                await post_markdown(client, channel, thread,
-                                    ":warning: " + reason + "\nStatus: blocked — task continuation stopped; see the trace.")
+                task_updates.queue(run.dir, ":warning: " + reason + "\nStatus: blocked — task continuation stopped; see the trace.", token=update_token)
             if not posted and run.meta().get("automatic_updates", True):
                 text = last_text if final["status"] == "done" and last_text else f":warning: The run ended ({final['status']}). See the dashboard."
-                await post_markdown(client, channel, thread, text)
+                task_updates.queue(run.dir, text, token=update_token)
+            if final["status"] == "cancelled" and task_updates.current(run.dir) == update_token:
+                task_updates.clear(run.dir)
         tasks.append(asyncio.create_task(wait_and_post()))
     return tasks
+
+
+
+_TASK_UPDATE_LOCK = asyncio.Lock()
+
+
+async def task_update_tick(client) -> None:
+    """Serialize deliveries within the bot; receipt state survives its restart."""
+    async with _TASK_UPDATE_LOCK:
+        await _task_update_tick(client)
+
+
+async def _task_update_tick(client) -> None:
+    """Deliver only the latest saved summary, never more often than fifteen minutes."""
+    if pause.is_paused():
+        return
+    for meta in list_runs(2000, include_running=True):
+        if not meta.get("slack_channel") or not meta.get("slack_thread"):
+            continue
+        run = Run(meta["id"])
+        if meta.get("status") == "cancelled":
+            task_updates.clear(run.dir)
+            continue
+        item = task_updates.due(run.dir, active=meta.get("status") == "running",
+                                enabled=meta.get("automatic_updates", True))
+        if not item:
+            continue
+        # Recheck generation after awaiting a previous run's delivery.
+        if task_updates.current(run.dir) != item.get("token"):
+            continue
+        response = await client.chat_postMessage(channel=meta["slack_channel"],
+            thread_ts=meta["slack_thread"], text=":arrows_counterclockwise: Task update:\n" + item["body"])
+        if response and response.get("ok") and response.get("ts"):
+            task_updates.ack(run.dir, item)
+
+
+async def task_update_scheduler(client) -> None:
+    while True:
+        try:
+            await task_update_tick(client)
+        except Exception:
+            log.exception("task update delivery failed; retained for retry")
+        await asyncio.sleep(30)
 
 
 def _start_dashboard() -> None:
@@ -1384,6 +1446,7 @@ async def main() -> None:
     watchers = asyncio.create_task(watch_scheduler(app.client))  # noqa: F841
     held = asyncio.create_task(held_scheduler(app.client))  # noqa: F841
     chief_jobs = chief.start(app.client, NOTIFY_CHANNEL, NOTIFY_USER, DASHBOARD_URL)  # noqa: F841
+    RESUMED.append(asyncio.create_task(task_update_scheduler(app.client)))
     RESUMED.extend(await finish_adopted_slack_runs(app.client))  # hold the tasks so they are not collected
     await resume_live_runs(app.client)
     handler = AsyncSocketModeHandler(app, SLACK_APP_TOKEN)

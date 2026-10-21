@@ -9,6 +9,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -45,6 +46,7 @@ class FakeRun:
 
     def __init__(self, run_id="20261007-120000-abcdef"):
         self.id = run_id
+        self.dir = Path(os.environ["COS_HOME"]) / "runs" / run_id
 
     @classmethod
     def create(cls, *args, **kwargs):
@@ -87,6 +89,7 @@ class HeadlessBackgroundTest(unittest.IsolatedAsyncioTestCase):
         FakeRun.release.clear()
         FakeRun.answered.clear()
         self.patches = [
+            patch.dict(os.environ, {"COS_HOME": self.tmp.name}),
             patch.object(sessions, "_STORE_PATH", Path(self.tmp.name) / "sessions.json"),
             patch.object(app, "Run", FakeRun),
             patch.object(app, "agent_brief", lambda *a, **k: ""),
@@ -115,7 +118,9 @@ class HeadlessBackgroundTest(unittest.IsolatedAsyncioTestCase):
         FakeRun.release.set()
         self.assertTrue(await task)
         self.assertEqual(client.posts.count("The answer."), 1)
-        self.assertTrue(any("CI went green." in p for p in client.posts))
+        self.assertFalse(any("CI went green." in p for p in client.posts))
+        queued = app.task_updates.due(Path(self.tmp.name) / "runs" / "20261007-120000-abcdef", active=False, now=time.time()+901)
+        self.assertEqual(queued["body"], "CI went green.")
         self.assertNotIn("1.0", app.ANSWERED)
         self.assertNotIn("1.0", app.HEADLESS)
 
@@ -188,7 +193,8 @@ class AdoptedSlackRunTest(unittest.IsolatedAsyncioTestCase):
         run = self._run([{"kind": "result", "body": "The answer.", "data": {}}], pid=None)
         client = FakeClient()
         await self._adopt(client)
-        self.assertEqual(client.posts, ["The answer."])
+        self.assertEqual(client.posts, [])
+        self.assertEqual(app.task_updates.due(run.dir, active=False, now=time.time()+901)["body"], "The answer.")
         self.assertEqual(app.Run(run.id).meta()["status"], "done")
 
     async def test_answer_the_old_bot_posted_is_not_repeated(self):

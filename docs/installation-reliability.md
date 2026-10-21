@@ -53,3 +53,15 @@ When the owner asks to stop automatic updates for a task, persist
 Use `--enabled true` when requested again. This mutes automatic background result
 messages, including completion/failure notices, without stopping internal work.
 Direct responses to a new owner message still appear. Never treat muting as cancel.
+
+### Slack task update cadence
+
+Direct answers to owner requests remain immediate. Automatic background summaries are
+coalesced per task and delivered first after 15 minutes from the request, then at
+15-minute intervals while work continues. Terminal background results use the same
+cadence and are sent once. The latest summary and delivery clock survive restarts;
+new accepted owner requests and cancellation invalidate old queued summaries.
+`automatic_updates=false` and global pause suppress automatic delivery. A successful
+Slack receipt is required before advancing the notification clock; failed delivery
+is retried by the scheduler. Internal execution continues on its separate schedule.
+Notification state is stored in each run's `task-updates.json`.

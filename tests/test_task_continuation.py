@@ -49,6 +49,25 @@ class DurableContinuationTest(unittest.TestCase):
         self.assertEqual(meta['conclusion']['state'],'needs-you')
         self.assertEqual((Path(self.tmp.name)/'calls').read_text(),'1')
 
+    def test_evidence_block_prevents_busy_retries_without_asking_approval(self):
+        run=self.exercise('codex',state='waiting')
+        tasks.block(run.id, 'Provider credentials unavailable', kind='access')
+        meta=run.execute()
+        self.assertEqual(meta['conclusion']['state'],'blocked')
+        self.assertEqual((Path(self.tmp.name)/'calls').read_text(),'1')
+
+    def test_recovered_technical_block_is_not_a_human_gate(self):
+        run=self.exercise('codex',state='waiting')
+        tasks.block(run.id, 'Receipt unavailable', kind='evidence')
+        run.update_meta(status='running',pid=None,retry_owner=99999999,turns=1,session_id='test-session',
+                        continuation={'kind':'waiting','prompt':'continue','due_at':time.time()-1,
+                                      'turn':1,'attempt':1})
+        events=[]
+        final=run.adopt(on_event=events.append)
+        self.assertEqual(final['conclusion']['state'],'blocked')
+        self.assertTrue(any('Status: blocked' in e.get('body','') for e in events))
+        self.assertFalse(any('Status: needs-you' in e.get('body','') for e in events))
+
     def test_sleep_has_a_durable_checkpoint_and_cancel_clears_it(self):
         run=self.exercise('codex')
         outcome={}

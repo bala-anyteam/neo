@@ -31,3 +31,16 @@ Every report includes run/event sample counts. Fewer than ten sampled runs in ei
 Reads retain at most the newest 2,000 run directories by ID, 64 KiB metadata per run, and 2 MB events per run, with a 32 MB total run-event scan budget per cohort plus a 2 MB bounded tail of loop evidence refusals. Event lines over 64 KiB are discarded in bounded chunks; tool bodies are never included in measurement. Reports expose oversized-line, truncated-file and run-cap counts in JSON. Bounds and missing/malformed logs can undercount history. The sent ledger retains the newest 2,000 acknowledgments; scheduling scans a bounded seven-day failure window.
 
 Installation authorization covers this reliability installation, not arbitrary product deployments. Continue already authorized work from persistent checkpoints, retain exact release pins, require source-backed proof, surface real blockers, and keep progress concise. Preserve these rules in the installed operating prompt and durable task contracts.
+
+## Typed blockers
+New CLI blocks require `--kind access`, `--kind evidence`, or `--kind human`.
+Human blocks also require `--source`, `--approver`, and `--decision`. Technical
+blocks report `blocked`, not `needs-you`, including after restart. Pending automated
+work stays `waiting` and uses durable continuation rather than permanent blocks.
+Future release gates belong in release scope until their action is reached; they do
+not prohibit earlier authorized preparation. Existing untyped blocks remain human
+gates for compatibility and must be reviewed rather than automatically reclassified.
+This validates structure, not the truth of an agent's cited policy or exhaustion of
+access paths; incorrect classification still requires investigation.
+
+Clear a resolved technical blocker with `tasks resolve --run ID --evidence "verified resolution source"`; no owner approval is implied. Human and legacy gates reject this command and require actual sourced approval via unblock.

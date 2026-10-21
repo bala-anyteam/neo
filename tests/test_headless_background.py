@@ -119,6 +119,21 @@ class HeadlessBackgroundTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("1.0", app.ANSWERED)
         self.assertNotIn("1.0", app.HEADLESS)
 
+    async def test_muted_background_updates_keep_direct_answer(self):
+        client = FakeClient()
+        req = app.commands.parse('claude do the thing')
+        original = FakeRun.meta
+        with patch.object(FakeRun, 'meta', lambda run: {**original(run), 'automatic_updates': False}):
+            task=asyncio.create_task(app.run_headless(client,'C1','muted',None,req,'do the thing'))
+            for _ in range(100):
+                if 'The answer.' in client.posts:
+                    break
+                await asyncio.sleep(.01)
+            FakeRun.release.set()
+            self.assertTrue(await task)
+        self.assertIn('The answer.',client.posts)
+        self.assertFalse(any('CI went green.' in p for p in client.posts))
+
     async def test_follow_up_stops_leftover_background_work(self):
         CancellableRun.cancelled.clear()
         client = FakeClient()

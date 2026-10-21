@@ -20,19 +20,19 @@ class DurableContinuationTest(unittest.TestCase):
         tasks.contract(run.id,'ship',[{'id':'merge','title':'PR merged','proofs':[
             {'kind':'pr','url':'https://github.com/acme/repo/pull/1'}]}])
         events=[]
-        with patch('cos.proofs.verify',return_value={'verified':False,'reason':'PR still open'}):
+        with patch('cos.proofs.verify',side_effect=[{'verified':False,'reason':'PR still open'}, {'verified':True}]):
             meta=run.execute(on_event=events.append)
-        self.assertEqual(meta['status'],'failed')
+        self.assertEqual(meta['status'],'done')
         self.assertTrue(any(e.get('data',{}).get('completion_refused') for e in events))
-        self.assertFalse(any(e['kind']=='result' and 'Status: done' in e['body'] for e in events))
+        self.assertFalse(any(e['kind']=='result' and e.get('turn') == 1 and 'Status: done' in e['body'] for e in events))
 
     def test_restart_recovers_durable_wait_once(self):
         run=self.exercise('codex',state='done')
         dead=subprocess.Popen(['true']); dead.wait()
         run.update_meta(status='running',pid=None,retry_owner=dead.pid,turns=1,session_id='test-session',
-                        waiting_continuations=1,continuation={
+                        waiting_continuations=100,continuation={
                             'kind':'waiting','prompt':runner.WAITING_CONTINUATION_PROMPT,
-                            'due_at':time.time()-1,'turn':1,'attempt':1})
+                            'due_at':time.time()-1,'turn':1,'attempt':100})
         events=[]
         final=runner.Run(run.id).adopt(on_event=events.append)
         self.assertIsNotNone(final)
@@ -41,6 +41,18 @@ class DurableContinuationTest(unittest.TestCase):
         self.assertIsNone(runner.Run(run.id).adopt())
         self.assertEqual((Path(self.tmp.name)/'calls').read_text(),'1')
         self.assertTrue(any(e.get('data',{}).get('continuation_recovered') for e in events))
+
+    def test_restart_preserves_remaining_five_minute_wait(self):
+        run=self.exercise('codex',state='done')
+        run.update_meta(status='running',pid=None,retry_owner=99999999,turns=1,session_id='s',
+                        waiting_continuations=100,continuation={
+                            'kind':'waiting','prompt':'continue',
+                            'due_at':time.time()+290,'turn':1,'attempt':100})
+        with patch.object(run,'_wait_checkpoint') as wait:
+            result=run._resume_pending()
+        self.assertEqual(result['status'],'done')
+        self.assertGreater(wait.call_args.args[1],280)
+        self.assertLessEqual(wait.call_args.args[1],290)
 
     def test_human_gate_prevents_auto_continuation(self):
         run=self.exercise('codex',state='waiting')

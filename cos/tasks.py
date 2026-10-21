@@ -203,15 +203,26 @@ def resolve(run_id, evidence):
     return show(run_id)
 
 
+def updates(run_id, enabled, source):
+    from .runner import Run
+    _path(run_id)  # validate identity and existence before updating metadata
+    if type(enabled) is not bool or not isinstance(source, str) or not source.strip():
+        raise ValueError('boolean update preference and owner instruction source required')
+    return Run(run_id).update_meta(automatic_updates=enabled, automatic_updates_source=source[:1000])
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='command', required=True)
-    for name in ('contract','check','show','release','block','unblock','resolve'):
+    for name in ('contract','check','show','release','block','unblock','resolve','updates'):
         cmd = sub.add_parser(name)
         cmd.add_argument('--run', default=os.environ.get('NEO_RUN_ID'))
         if name == 'contract':
             cmd.add_argument('--goal', required=True)
             cmd.add_argument('--steps', required=True, type=json.loads)
+        if name == 'updates':
+            cmd.add_argument('--enabled', choices=('true', 'false'), required=True)
+            cmd.add_argument('--source', required=True)
         if name == 'resolve': cmd.add_argument('--evidence', required=True)
         if name == 'check': cmd.add_argument('--step', required=True)
         if name == 'release': cmd.add_argument('--scope', required=True, type=json.loads)
@@ -228,6 +239,7 @@ def main():
         elif args.command == 'check': result = check(args.run,args.step)
         elif args.command == 'release': result = release(args.run,args.scope,args.approval)
         elif args.command == 'block': result = block(args.run,args.reason,args.kind,args.source,args.approver,args.decision)
+        elif args.command == 'updates': result = updates(args.run,args.enabled == 'true',args.source)
         elif args.command == 'resolve': result = resolve(args.run,args.evidence)
         elif args.command == 'unblock': result = unblock(args.run,args.approval)
         else: result = {**show(args.run), 'unmet': unmet(args.run)}

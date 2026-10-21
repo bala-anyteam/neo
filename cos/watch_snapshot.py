@@ -9,13 +9,13 @@ import re
 import subprocess
 from datetime import datetime, timezone, timedelta
 
-ISSUE_FIELDS = '''number title url body createdAt updatedAt
+ISSUE_FIELDS = '''number title url body createdAt updatedAt lastEditedAt editor{login __typename}
 assignees(first:100){nodes{login}}
 labels(first:100){nodes{name}}
-comments(first:100){nodes{author{login} body createdAt url} pageInfo{hasNextPage endCursor}}
+comments(first:100){nodes{author{login __typename} body createdAt url lastEditedAt editor{login __typename}} pageInfo{hasNextPage endCursor}}
 timelineItems(first:100,itemTypes:[CROSS_REFERENCED_EVENT]){
  nodes{... on CrossReferencedEvent{createdAt source{... on PullRequest{
- number title url state mergedAt author{login} baseRefName headRefName repository{nameWithOwner}
+ number title url state mergedAt author{login __typename} baseRefName headRefName repository{nameWithOwner}
  }}}} pageInfo{hasNextPage endCursor}}
 '''
 
@@ -38,7 +38,7 @@ def graphql(query, **variables):
     return gh(*args)['data']['repository']
 
 
-def collect(repo: str) -> dict:
+def collect(repo: str, include_metadata: bool = True) -> dict:
     if not re.fullmatch(r'[\w.-]+/[\w.-]+', repo):
         raise ValueError('issue_repo must be owner/repo')
     owner, name = repo.split('/')
@@ -55,8 +55,8 @@ def collect(repo: str) -> dict:
     # Fully page comments and linked PR history, including old issues with long bot histories.
     for issue in issues:
         for field, selection in [
-            ('comments', 'comments(first:100,after:$cursor){nodes{author{login} body createdAt url} pageInfo{hasNextPage endCursor}}'),
-            ('timelineItems', 'timelineItems(first:100,after:$cursor,itemTypes:[CROSS_REFERENCED_EVENT]){nodes{... on CrossReferencedEvent{createdAt source{... on PullRequest{number title url state mergedAt author{login} baseRefName headRefName repository{nameWithOwner}}}}} pageInfo{hasNextPage endCursor}}'),
+            ('comments', 'comments(first:100,after:$cursor){nodes{author{login __typename} body createdAt url lastEditedAt editor{login __typename}} pageInfo{hasNextPage endCursor}}'),
+            ('timelineItems', 'timelineItems(first:100,after:$cursor,itemTypes:[CROSS_REFERENCED_EVENT]){nodes{... on CrossReferencedEvent{createdAt source{... on PullRequest{number title url state mergedAt author{login __typename} baseRefName headRefName repository{nameWithOwner}}}}} pageInfo{hasNextPage endCursor}}'),
         ]:
             connection = issue[field]
             while connection['pageInfo']['hasNextPage']:
@@ -65,6 +65,8 @@ def collect(repo: str) -> dict:
                 connection['nodes'].extend(more['nodes'])
                 connection['pageInfo'] = more['pageInfo']
     snapshot = {'repo':repo, 'fetched_at':datetime.now(timezone.utc).isoformat(), 'issues':issues, 'source_errors':[]}
+    if not include_metadata:
+        return snapshot
     try:
         since = (datetime.now(timezone.utc) - timedelta(days=7)).date().isoformat()
         snapshot['recently_closed'] = gh('issue','list','--repo',repo,'--state','closed',

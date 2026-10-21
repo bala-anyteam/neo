@@ -56,7 +56,7 @@ class TaskUpdateDeliveryTest(unittest.IsolatedAsyncioTestCase):
             await app.handle_mention({'user': 'U1', 'channel': 'C1', 'thread_ts': '1.0',
                                       'ts': '1.1', 'text': 'how is it going'}, self.client)
         self.assertEqual(task_updates.current(self.run.dir), self.token)
-        self.assertIn('Still working', self.client.chat_postMessage.call_args.kwargs['text'])
+        self.assertIn('follow-up was not started', self.client.chat_postMessage.call_args.kwargs['text'])
 
     async def test_restart_before_first_direct_answer_does_not_delay_owner_reply(self):
         import asyncio

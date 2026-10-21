@@ -27,11 +27,17 @@ class FakeClient:
 
 
 class FolderRun:
+    from cos.runner import Run as _RecordedRun
+    pending_valid = staticmethod(_RecordedRun.pending_valid)
     runs: dict = {}
     executed: list = []
 
     def __init__(self, run_id):
         self.id = run_id
+
+    @property
+    def dir(self):
+        return self.root / self.id
 
     @classmethod
     def create(cls, engine, prompt, cwd, mode, **kwargs):
@@ -59,6 +65,7 @@ class ThreadFolderTest(unittest.IsolatedAsyncioTestCase):
         for d in (self.old, self.new, self.pin):
             d.mkdir()
         FolderRun.runs, FolderRun.executed = {}, []
+        FolderRun.root = Path(self.tmp.name) / "runs"
         self.patches = [
             patch.object(sessions, "_STORE_PATH", Path(self.tmp.name) / "sessions.json"),
             patch.object(app, "Run", FolderRun),

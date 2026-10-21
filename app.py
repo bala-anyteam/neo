@@ -39,11 +39,11 @@ import sessions  # noqa: E402
 from commands import Progress, clip, code_block  # noqa: E402
 from cos import brief as morning, fleet, pause, settings, watches  # noqa: E402
 from cos.alerts import AlertGate  # noqa: E402
-from cos import autonomy, learn, task_updates  # noqa: E402
+from cos import autonomy, learn, task_updates, failure_context  # noqa: E402
 from cos.config import controller_engine, controller_model, OWNER_MESSAGE_MARK, THREAD_CONTEXT_HEAD, agent_brief, default_engine, exit_with_parent, workdir  # noqa: E402
 from cos.herdr import Herdr, HerdrError  # noqa: E402
 from cos.interactive import InteractiveRun  # noqa: E402
-from cos.runner import ENGINES, MODES, Run, cos_home, list_runs, pid_alive  # noqa: E402
+from cos.runner import ENGINES, MODES, Run, RunBusyError, cos_home, list_runs, pid_alive  # noqa: E402
 
 # Only these Slack user ids may trigger the bot. This is the security gate:
 # a triggered session runs an agent on this machine with tool access, so never
@@ -299,12 +299,27 @@ def _same_folder(a: Optional[str], b: str) -> bool:
     return bool(a) and Path(a).expanduser().resolve() == Path(b).expanduser().resolve()
 
 
+def _run_active(run):
+    meta = run.meta()
+    return meta.get("status") == "running" and (
+        pid_alive(meta.get("pid")) or pid_alive(meta.get("retry_owner")) or Run.pending_valid(meta))
+
+
+def _busy_message(run):
+    return ("The existing task is still running. This follow-up was not started, so it has not "
+            "changed or stopped that work. Automatic updates remain on the task’s configured schedule. "
+            "Use `@Nio stop` only if you want to interrupt it. " + failure_context.trace_link(run, DASHBOARD_URL))
+
+
 async def run_headless(client, channel: str, thread_ts: str, entry: Optional[dict], req, prompt: str,
                        kind: Optional[str] = None) -> bool:
     engine = req.engine or (entry or {}).get("engine") or default_engine()
     same_engine = entry and entry.get("runtime") == "headless" and entry.get("engine") == engine
     # A folder named with cwd= sticks to the thread; otherwise follow-ups use today's WORKDIR.
     previous = Run(entry["run_id"]) if same_engine and entry.get("run_id") else None
+    if previous and _run_active(previous):
+        await client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=_busy_message(previous))
+        return True
     if req.cwd:
         pinned = req.cwd
     elif entry and "cwd" in entry:
@@ -332,7 +347,8 @@ async def run_headless(client, channel: str, thread_ts: str, entry: Optional[dic
             # Thread from before run tracking: resume its engine session.
             run.update_meta(session_id=entry["session_id"])
             follow_up = True
-    update_token = task_updates.begin(run.dir, direct=True)
+    # A reused run may be claimed concurrently; do not reset its clock until execution emits.
+    update_token = None if follow_up else task_updates.begin(run.dir, direct=True)
     await sessions.set_thread(thread_ts, {"run_id": run.id, "engine": engine, "runtime": "headless", "cwd": pinned})
 
     progress = Progress(engine, "headless", run.meta()["mode"], run.id, DASHBOARD_URL)
@@ -345,6 +361,7 @@ async def run_headless(client, channel: str, thread_ts: str, entry: Optional[dic
     def on_event(event: dict) -> None:
         loop.call_soon_threadsafe(queue.put_nowait, event)
 
+    prior_headless = HEADLESS.get(thread_ts)
     HEADLESS[thread_ts] = run
     task = asyncio.create_task(asyncio.to_thread(run.execute, prompt if follow_up else None, on_event))
     meta: dict = {"status": "failed"}
@@ -353,6 +370,7 @@ async def run_headless(client, channel: str, thread_ts: str, entry: Optional[dic
     # and wakes again for each one that finishes. Waiting for the exit held the answer back for
     # up to 90 minutes, so the answer goes out on the first result and later ones follow it.
     posted: list[str] = []
+    failure_error = None
     try:
         while not (task.done() and queue.empty()):
             try:
@@ -361,6 +379,8 @@ async def run_headless(client, channel: str, thread_ts: str, entry: Optional[dic
                 if not posted:
                     await reporter.update()
                 continue
+            if update_token is None:
+                update_token = task_updates.begin(run.dir, direct=True)
             progress.add(event)
             if event["kind"] == "result" and progress.final.strip():
                 if task_updates.current(run.dir) != update_token:
@@ -380,9 +400,15 @@ async def run_headless(client, channel: str, thread_ts: str, entry: Optional[dic
             if not posted:
                 await reporter.update()
         meta = await task
+    except RunBusyError:
+        # Another owner acquired the run after our preflight check. Its engine is untouched.
+        await reporter.finish("done", True)
+        await reporter.say(_busy_message(run))
+        return True
     except Exception as exc:  # noqa: BLE001 - surface any failure back into Slack
         log.exception("headless run failed for thread=%s", thread_ts)
-        progress.errors.append(f"{type(exc).__name__}: {exc}")
+        failure_error = exc
+        progress.errors.append(failure_context.safe_reason(run, exc))
         if not task.done():
             # Do not leave the engine running with nothing reporting on it.
             await asyncio.to_thread(run.cancel)
@@ -391,7 +417,11 @@ async def run_headless(client, channel: str, thread_ts: str, entry: Optional[dic
             except Exception:  # noqa: BLE001 - already reporting a failure
                 pass
     finally:
-        HEADLESS.pop(thread_ts, None)
+        if HEADLESS.get(thread_ts) is run:
+            if prior_headless is not None:
+                HEADLESS[thread_ts] = prior_headless
+            else:
+                HEADLESS.pop(thread_ts, None)
         ANSWERED.discard(thread_ts)
 
     status = meta.get("status", "failed")
@@ -401,14 +431,14 @@ async def run_headless(client, channel: str, thread_ts: str, entry: Optional[dic
             if task_updates.current(run.dir) == update_token:
                 task_updates.clear(run.dir)
         elif status != "done":
-            task_updates.queue(run.dir, f":warning: Background work from this turn ended `{status}`. See the trace.", token=update_token)
+            task_updates.queue(run.dir, f":warning: {failure_context.safe_reason(run, failure_error)} {failure_context.trace_link(run, DASHBOARD_URL)}", token=update_token)
         return status in ("done", "cancelled")
     answered = bool(progress.final.strip())
     await reporter.finish(status, answered)
     if answered:
         await reporter.say(progress.final)
     elif status != "done":
-        await reporter.say(":warning: The run ended without an answer. See the trace.")
+        await reporter.say(f":warning: {failure_context.safe_reason(run, failure_error)} {failure_context.trace_link(run, DASHBOARD_URL)}")
     return status == "done"
 
 
@@ -1214,11 +1244,19 @@ async def handle_mention(event: dict, client) -> None:
     if req.cwd and not os.path.isdir(req.cwd):
         await client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=f":x: Not a folder on this machine: `{req.cwd}`")
         return
+    # Adopted/automatic continuations are not necessarily present in this process's BUSY set.
+    # Check persisted ownership before clearing notifications or trying to claim another turn.
+    if entry and entry.get("runtime") == "headless" and entry.get("run_id"):
+        existing = Run(entry["run_id"])
+        if _run_active(existing):
+            await client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=_busy_message(existing))
+            return
     stopped_background = thread_ts in ANSWERED and await _end_background(thread_ts)
     if not stopped_background and (thread_ts in BUSY or thread_ts in HEADLESS):
         await client.chat_postMessage(
             channel=channel, thread_ts=thread_ts,
-            text="Still working on the previous message. `@neo stop` to interrupt it.",
+            text=(_busy_message(Run(entry["run_id"])) if entry and entry.get("run_id") else
+                  "The previous task is still running. This follow-up was not started. Use `@Nio stop` to interrupt it."),
         )
         return
     BUSY.add(thread_ts)  # no await between the check and this line
@@ -1252,7 +1290,11 @@ async def handle_mention(event: dict, client) -> None:
         ok = False
         log.exception("mention failed for thread=%s", thread_ts)
         await client.chat_postMessage(
-            channel=channel, thread_ts=thread_ts, text=f":x: Failed: `{type(exc).__name__}: {exc}`"
+            channel=channel, thread_ts=thread_ts,
+            text=(f":x: {failure_context.safe_reason(Run(entry['run_id']), exc)} "
+                  f"{failure_context.trace_link(Run(entry['run_id']), DASHBOARD_URL)}"
+                  if entry and entry.get("run_id") else
+                  ":x: Nio could not start this request. The error is recorded in the service log; no completion is established.")
         )
     finally:
         BUSY.discard(thread_ts)
@@ -1347,10 +1389,10 @@ async def finish_adopted_slack_runs(client) -> list:
                     break
                 await asyncio.sleep(_ADOPT_POLL_SECONDS)
             if posted and final["status"] == "failed" and run.meta().get("automatic_updates", True):
-                reason = (final.get("conclusion") or {}).get("line") or "Inspect the trace for the concrete blocker."
+                reason = failure_context.safe_reason(run) + " " + failure_context.trace_link(run, DASHBOARD_URL)
                 task_updates.queue(run.dir, ":warning: " + reason + "\nStatus: blocked — task continuation stopped; see the trace.", token=update_token)
             if not posted and run.meta().get("automatic_updates", True):
-                text = last_text if final["status"] == "done" and last_text else f":warning: The run ended ({final['status']}). See the dashboard."
+                text = last_text if final["status"] == "done" and last_text else f":warning: {failure_context.safe_reason(run)} {failure_context.trace_link(run, DASHBOARD_URL)}"
                 task_updates.queue(run.dir, text, token=update_token)
             if final["status"] == "cancelled" and task_updates.current(run.dir) == update_token:
                 task_updates.clear(run.dir)

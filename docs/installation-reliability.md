@@ -44,3 +44,12 @@ This validates structure, not the truth of an agent's cited policy or exhaustion
 access paths; incorrect classification still requires investigation.
 
 Clear a resolved technical blocker with `tasks resolve --run ID --evidence "verified resolution source"`; no owner approval is implied. Human and legacy gates reject this command and require actual sourced approval via unblock.
+
+Waiting Slack tasks automatically resume after 15s, 60s and 180s, then every 300s
+indefinitely while waiting. Human/access/evidence blockers, cancellation and real
+engine failures still stop the loop; API failure retries retain their separate limits.
+When the owner asks to stop automatic updates for a task, persist
+`tasks updates --run ID --enabled false --source "owner message permalink or exact instruction"`.
+Use `--enabled true` when requested again. This mutes automatic background result
+messages, including completion/failure notices, without stopping internal work.
+Direct responses to a new owner message still appear. Never treat muting as cancel.

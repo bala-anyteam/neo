@@ -26,3 +26,17 @@ class PendingReporterTest(unittest.IsolatedAsyncioTestCase):
             for observer in observers: await asyncio.wait_for(observer,5)
         self.assertEqual(client.posts,['Status: done — verified new turn'])
         self.assertEqual(run.meta()['slack_posted_seq'],0)
+
+    async def test_task_update_opt_out_survives_adoption_and_suppresses_posts(self):
+        from cos import tasks
+        app=fixture.app
+        run=self._run([],pid=os.getpid(),session_id='s1',conclude=True)
+        tasks.updates(run.id, False, 'Owner: stop automatic updates for this task')
+        client=fixture.FakeClient()
+        observers=await app.finish_adopted_slack_runs(client)
+        await asyncio.sleep(.03)
+        run.append_event({'kind':'result','body':'Status: done — background completion','data':{}},2)
+        run.update_meta(status='done',turns=2)
+        for observer in observers: await asyncio.wait_for(observer,5)
+        self.assertEqual(client.posts,[])
+        self.assertFalse(run.meta()['automatic_updates'])

@@ -364,7 +364,8 @@ async def run_headless(client, channel: str, thread_ts: str, entry: Optional[dic
                 if not posted:
                     await reporter.finish("done", True)
                 if progress.final.strip() not in posted:
-                    await reporter.say(progress.final if not posted else ":arrows_counterclockwise: _Task update:_\n" + progress.final)
+                    if not posted or run.meta().get("automatic_updates", True):
+                        await reporter.say(progress.final if not posted else ":arrows_counterclockwise: _Task update:_\n" + progress.final)
                     posted.append(progress.final.strip())
                     run.update_meta(slack_posted_seq=event.get("seq"))  # a restarted bot must not repeat it
                 ANSWERED.add(thread_ts)
@@ -387,7 +388,7 @@ async def run_headless(client, channel: str, thread_ts: str, entry: Optional[dic
 
     status = meta.get("status", "failed")
     if posted:
-        if status not in ("done", "cancelled"):
+        if status not in ("done", "cancelled") and run.meta().get("automatic_updates", True):
             await reporter.say(f":warning: Background work from this turn ended `{status}`. See the trace.")
         return status in ("done", "cancelled")
     answered = bool(progress.final.strip())
@@ -1311,8 +1312,9 @@ async def finish_adopted_slack_runs(client) -> list:
                     elif event["kind"] == "result" and posted_seq is not None and event.get("seq", -1) <= posted_seq:
                         posted.append(body)  # the old bot already posted this one
                     elif event["kind"] == "result" and body not in posted:
-                        await post_markdown(client, channel, thread,
-                                            body if not posted else ":arrows_counterclockwise: _Task update:_\n" + body)
+                        if run.meta().get("automatic_updates", True):
+                            await post_markdown(client, channel, thread,
+                                                body if not posted else ":arrows_counterclockwise: _Task update:_\n" + body)
                         posted.append(body)
                         run.update_meta(slack_posted_seq=event.get("seq"))
                 if final["status"] != "running":
@@ -1326,11 +1328,11 @@ async def finish_adopted_slack_runs(client) -> list:
                     final = run.update_meta(status="done" if posted else "failed", pid=None)
                     break
                 await asyncio.sleep(_ADOPT_POLL_SECONDS)
-            if posted and final["status"] == "failed":
+            if posted and final["status"] == "failed" and run.meta().get("automatic_updates", True):
                 reason = (final.get("conclusion") or {}).get("line") or "Inspect the trace for the concrete blocker."
                 await post_markdown(client, channel, thread,
                                     ":warning: " + reason + "\nStatus: blocked — task continuation stopped; see the trace.")
-            if not posted:
+            if not posted and run.meta().get("automatic_updates", True):
                 text = last_text if final["status"] == "done" and last_text else f":warning: The run ended ({final['status']}). See the dashboard."
                 await post_markdown(client, channel, thread, text)
         tasks.append(asyncio.create_task(wait_and_post()))

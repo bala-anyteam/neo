@@ -44,13 +44,14 @@ AUTO_RESTART_DELAYS = (15.0, 60.0, 180.0)  # seconds before each attempt; its le
 # human prompts all the same, so an agent that always fails at the same point cannot loop forever.
 MAX_AUTO_RESTARTS_PER_PROMPT = 6
 # A successful process exit is not task completion when the agent says it is waiting.
-# Keep this separate from API retries, scoped to briefed Slack agents, and bounded.
+# Keep this separate from API retries, scoped to briefed Slack agents.
 WAITING_CONTINUATION_DELAYS = (15.0, 60.0, 180.0)
+WAITING_CONTINUATION_INTERVAL = 300.0
 WAITING_CONTINUATION_PROMPT = (
     "Your last turn ended with Status: waiting, but the requested task is unfinished. "
     "Continue the already-authorized task from the recorded state. Inspect current checks and rollout "
     "before acting; do not repeat a completed merge, release or deployment. Keep waiting/polling with "
-    "tools while work can proceed. Preserve all human approval gates, including stage-video review. "
+    "tools while work can proceed. Preserve applicable human approval gates verified against direct owner instructions or repository policy; do not infer gates from agent-generated memory alone. "
     "If a person must act, stop with Status: needs-you and name the person and exact action. "
     "If you cannot proceed, use Status: blocked with the concrete reason. Do not expand scope."
 )
@@ -338,7 +339,7 @@ class Run:
     def _continue_waiting(self, final: dict, on_event=None, attempts: Optional[int] = None) -> dict:
         """Continue clean waiting exits without conflating an engine turn with the user's task.
 
-        Adoption uses the persisted attempt count, so a bot restart cannot reset the cap.
+        Adoption preserves the attempt count and five-minute steady polling interval.
         Explicit human/blocked conclusions and non-Slack jobs are never continued.
         """
         emit = on_event or (lambda _e: None)
@@ -346,17 +347,18 @@ class Run:
         while (final.get("status") == "done" and final.get("source") == "slack"
                and final.get("conclude") and (final.get("conclusion") or {}).get("state") == "waiting"
                and not self._cancelled):
-            if not final.get("session_id") or attempts >= len(WAITING_CONTINUATION_DELAYS):
+            if not final.get("session_id"):
                 with self._lock:
                     current = self.meta()
                     if current["status"] != "done" or current["turns"] != final["turns"]:
                         return current
                     message = "Unfinished task could not be continued; inspect the trace before resuming."
-                    emit(self.append_event({"kind": "error", "title": "Continuation limit reached",
+                    emit(self.append_event({"kind": "error", "title": "Continuation session unavailable",
                                             "body": message, "data": {"attempts": attempts}}, final["turns"]))
                     return self.update_meta(status="failed", retry_owner=None,
                                             conclusion={"state": "blocked", "line": message})
-            delay = WAITING_CONTINUATION_DELAYS[attempts]
+            delay = (WAITING_CONTINUATION_DELAYS[attempts] if attempts < len(WAITING_CONTINUATION_DELAYS)
+                     else WAITING_CONTINUATION_INTERVAL)
             wake = _wake_event(self.id)
             with self._lock:
                 current = self.meta()
@@ -368,7 +370,7 @@ class Run:
                                  continuation={"kind":"waiting", "prompt":WAITING_CONTINUATION_PROMPT,
                                                "due_at":time.time()+delay, "turn":final["turns"], "attempt":attempts+1})
             emit(self.append_event({"kind": "status", "title": "Continue unfinished task",
-                                    "body": f"Resuming in {delay:.0f}s ({attempts + 1}/{len(WAITING_CONTINUATION_DELAYS)})",
+                                    "body": f"Resuming in {delay:.0f}s (attempt {attempts + 1})",
                                     "data": {"waiting_continuation": attempts + 1}}, final["turns"]))
             self._wait_checkpoint(wake, delay)
             final = self._execute_with_restarts(WAITING_CONTINUATION_PROMPT, on_event, retrying=True)
@@ -391,8 +393,8 @@ class Run:
                 or meta.get("pid") or pending.get("turn") != meta.get("turns")
                 or pending.get("kind") not in ("waiting", "api")):
             return False
-        limit = len(WAITING_CONTINUATION_DELAYS) if pending["kind"] == "waiting" else len(AUTO_RESTART_DELAYS)
-        if (type(pending.get("attempt")) is not int or not 1 <= pending["attempt"] <= limit
+        limit = None if pending["kind"] == "waiting" else len(AUTO_RESTART_DELAYS)
+        if (type(pending.get("attempt")) is not int or pending["attempt"] < 1 or (limit is not None and pending["attempt"] > limit)
                 or not isinstance(pending.get("due_at"), (float,int)) or not math.isfinite(pending["due_at"])):
             return False
         if pending["kind"] == "waiting":
@@ -428,7 +430,8 @@ class Run:
                                 "data":{"continuation_recovered":True}}, meta["turns"]))
         wake = _wake_event(self.id)
         wake.clear()
-        self._wait_checkpoint(wake, max(0, min(180, float(pending["due_at"])-time.time())))
+        maximum_delay = WAITING_CONTINUATION_INTERVAL if pending["kind"] == "waiting" else 180
+        self._wait_checkpoint(wake, max(0, min(maximum_delay, float(pending["due_at"])-time.time())))
         final = self._execute_with_restarts(pending.get("prompt"), on_event, retrying=True,
                                             keep_first_turn_args=bool(pending.get("keep_first_turn_args")))
         return self._continue_waiting(final, on_event)

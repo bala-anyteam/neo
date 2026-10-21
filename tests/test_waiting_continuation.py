@@ -80,14 +80,21 @@ class WaitingContinuationTest(unittest.TestCase):
         run.execute()
         self.assertEqual((Path(self.tmp.name) / "calls").read_text(), "1")
 
-    def test_repeated_waiting_is_bounded_and_reports_failure(self):
-        run = self.exercise("codex", state="waiting — still pending\nStatus: waiting")
-        events = []
-        meta = run.execute(on_event=events.append)
-        self.assertEqual(meta["status"], "failed")
-        self.assertEqual(meta["conclusion"]["state"], "blocked")
-        self.assertTrue(any(e["kind"] == "error" and e["title"] == "Continuation limit reached" for e in events))
-        self.assertIsNone(meta.get("retry_owner"))
+    def test_repeated_waiting_continues_after_three_at_300_seconds(self):
+        run = self.exercise('codex')
+        final = run.update_meta(status='done', turns=1, session_id='test-session',
+                                conclusion={'state':'waiting'})
+        delays=[]
+        def resume(*args, **kwargs):
+            n=len(delays)
+            return run.update_meta(status='done', turns=n+1,
+                                   conclusion={'state':'done' if n == 6 else 'waiting'})
+        with patch.object(runner, 'WAITING_CONTINUATION_DELAYS', (15.,60.,180.)), \
+             patch.object(run, '_wait_checkpoint', side_effect=lambda wake,delay: delays.append(delay)), \
+             patch.object(run, '_execute_with_restarts', side_effect=resume):
+            result=run._continue_waiting(final, attempts=0)
+        self.assertEqual(delays,[15.,60.,180.,300.,300.,300.])
+        self.assertEqual(result['conclusion']['state'],'done')
 
     def test_cancellation_interrupts_the_continuation_wait(self):
         run = self.exercise("codex")
@@ -105,18 +112,19 @@ class WaitingContinuationTest(unittest.TestCase):
         self.assertEqual(result["status"], "cancelled")
         self.assertEqual((Path(self.tmp.name) / "calls").read_text(), "1")
 
-    def test_adopted_engine_keeps_the_continuation_cap(self):
-        run = self.exercise("codex")
-        run.update_meta(status="running", pid=os.getpid(), turns=3,
-                        waiting_continuations=2, session_id="test-session")
-        finished = {**run.meta(), "status": "done", "conclusion": {"state": "waiting"}}
+    def test_adopted_engine_continues_beyond_initial_attempts(self):
+        run = self.exercise('codex')
+        run.update_meta(status='running', pid=os.getpid(), turns=3,
+                        waiting_continuations=20, session_id='test-session')
         def finish(*args, **kwargs):
-            return run.update_meta(**finished)
-        with patch.object(run, "_follow", side_effect=finish):
-            meta = run.adopt()
-        self.assertEqual(meta["status"], "failed")
-        self.assertEqual(meta["conclusion"]["state"], "blocked")
-        self.assertFalse((Path(self.tmp.name) / "calls").exists())
+            return run.update_meta(status='done',conclusion={'state':'waiting'})
+        with patch.object(run, '_follow', side_effect=finish), \
+             patch.object(run, '_wait_checkpoint') as wait, \
+             patch.object(run, '_execute_with_restarts', side_effect=lambda *a, **k: run.update_meta(
+                 status='done',conclusion={'state':'done'})):
+            meta=run.adopt()
+        self.assertEqual(meta['conclusion']['state'],'done')
+        self.assertEqual(wait.call_args.args[1],300.)
 
     def test_transient_failure_during_continuation_is_retried(self):
         run = self.exercise("codex", state="transient")

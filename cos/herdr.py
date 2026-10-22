@@ -179,6 +179,11 @@ class Herdr:
             else:
                 self.close_workspace(workspace_id)
 
+    def rename_lane(self, tab_id: str, pane_id: str, label: str) -> None:
+        """Rename both visible surfaces of a live task without touching its process."""
+        self.call("tab", "rename", tab_id, label)
+        self.call("pane", "rename", pane_id, label)
+
     def close_workspace(self, workspace_id: str) -> None:
         self.call("workspace", "close", workspace_id)
 

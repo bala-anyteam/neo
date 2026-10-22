@@ -43,7 +43,7 @@ from cos import autonomy, learn, task_updates, failure_context  # noqa: E402
 from cos.config import controller_engine, controller_model, OWNER_MESSAGE_MARK, THREAD_CONTEXT_HEAD, agent_brief, default_engine, exit_with_parent, workdir  # noqa: E402
 from cos.herdr import Herdr, HerdrError  # noqa: E402
 from cos.interactive import InteractiveRun  # noqa: E402
-from cos.layout import group_for_task, task_label  # noqa: E402
+from cos.layout import group_for_task, suggest_task_label, task_label  # noqa: E402
 from cos.runner import ENGINES, MODES, Run, RunBusyError, cos_home, list_runs, pid_alive  # noqa: E402
 
 # Only these Slack user ids may trigger the bot. This is the security gate:
@@ -571,6 +571,22 @@ async def start_live(client, channel: str, thread_ts: str, req, prompt: str) -> 
         await client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=clip(f":x: Could not start the live agent:\n{code_block(str(exc), 2000)}"))
         return False
     meta = live.irun.run.meta()
+
+    async def refine_label() -> None:
+        try:
+            refined = await asyncio.to_thread(suggest_task_label, req.prompt)
+            current = live.irun.run.meta()
+            if refined != title and current.get("herdr_tab") and current.get("herdr_pane"):
+                await asyncio.to_thread(
+                    live.irun.herdr.rename_lane,
+                    current["herdr_tab"], current["herdr_pane"], refined,
+                )
+        except Exception as exc:  # noqa: BLE001 - naming must never affect task execution
+            log.warning("could not refine Herdr label for %s: %s", meta["id"], type(exc).__name__)
+
+    label_task = asyncio.create_task(refine_label())
+    RESUMED.append(label_task)
+    label_task.add_done_callback(lambda task: RESUMED.remove(task) if task in RESUMED else None)
     await sessions.set_thread(thread_ts, {"run_id": meta["id"], "engine": engine, "runtime": "herdr"})
     remote = await asyncio.to_thread(live.irun.remote_url, 8)
     links = []

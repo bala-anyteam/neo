@@ -43,6 +43,7 @@ from cos import autonomy, learn, task_updates, failure_context  # noqa: E402
 from cos.config import controller_engine, controller_model, OWNER_MESSAGE_MARK, THREAD_CONTEXT_HEAD, agent_brief, default_engine, exit_with_parent, workdir  # noqa: E402
 from cos.herdr import Herdr, HerdrError  # noqa: E402
 from cos.interactive import InteractiveRun  # noqa: E402
+from cos.layout import group_for_task, task_label  # noqa: E402
 from cos.runner import ENGINES, MODES, Run, RunBusyError, cos_home, list_runs, pid_alive  # noqa: E402
 
 # Only these Slack user ids may trigger the bot. This is the security gate:
@@ -544,6 +545,8 @@ async def start_live(client, channel: str, thread_ts: str, req, prompt: str) -> 
     live = LiveThread(client, channel, thread_ts)
     LIVE[thread_ts] = live
     label = f"slack-{thread_ts.split('.')[0][-6:]}"
+    group = group_for_task(req.prompt, cwd)
+    title = task_label(req.prompt)
     system = await asyncio.to_thread(agent_brief, cwd)
     try:
         live.irun = await asyncio.to_thread(
@@ -558,6 +561,8 @@ async def start_live(client, channel: str, thread_ts: str, req, prompt: str) -> 
             live.on_event,
             (),
             system,
+            group,
+            title,
         )
     except Exception as exc:  # noqa: BLE001 - HerdrError, ValueError, OSError, ...
         log.exception("live start failed for thread=%s", thread_ts)
@@ -1272,7 +1277,7 @@ async def handle_mention(event: dict, client) -> None:
     ok = True
     try:
         live = await live_for(client, channel, thread_ts, entry)
-        if live and live.irun and not req.live and not req.engine:
+        if live and live.irun and not req.engine:
             # Follow-up in a live thread goes straight to the running agent.
             await asyncio.to_thread(live.irun.send, req.prompt)
         else:

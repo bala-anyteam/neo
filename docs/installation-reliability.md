@@ -77,3 +77,9 @@ and trace, preserving its engine and notification timer. A typed runner rejectio
 also handles the race after preflight without reporting task failure. This does not
 queue or steer the rejected instruction; the message explicitly says it was not
 started. Actual cancellation still requires the existing stop command.
+
+### Temporary monitoring engine overrides
+
+`engine_override` on a watch is an explicit `{ "engine": "codex", "expires_at": "2026-10-26T00:00:00+05:30" }` override. It leaves the configured engine, instructions and schedule intact. Effective engine selection checks the timezone-aware expiry at every dispatch; expired or malformed overrides use the configured engine. A cooldown applies only to the engine that failed.
+
+Network-isolated Codex watches retain the existing issue-repository collector. Three built-in monitoring IDs also have fixed, trusted read-only collectors: `sentry` (org-wide production unresolved issue list), `prod-logs` (configured production GCP project), and `desk-ci-fixes` (AnyTeamAI/anyteam-deskie run and PR samples plus the configured Deskie e2e Slack channel). Unknown non-issue watches remain rejected. The model receives a bounded local snapshot, without connectors or network access. Missing permissions, details or sources produce explicit `source_errors`; partial checks cannot advance `last_ok_at` or report a clean summary. Sentry uses authenticated fixed-host GET requests for org-wide issue counts and latest-event details for up to three issues. Credentials remain in the trusted collector process. Sampling limits mean these snapshots are not exhaustive.

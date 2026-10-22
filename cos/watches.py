@@ -19,7 +19,7 @@ import re
 import shutil
 import threading
 import tempfile
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -337,7 +337,7 @@ def prompt(watch: dict) -> str:
         "- Read only. Do not change anything anywhere: no resolving, assigning, commenting, deploying or pushing.",
         ("- Use shell/Python to read the local GitHub snapshot and absolute paths for local git history. "
          "The snapshot replaces all network lookups; do not attempt external calls."
-         if watch.get("engine") == "codex" else
+         if effective_engine(watch) == "codex" else
          "- Shell: one command per Bash call, no `cd` (use absolute paths or --project flags), and the Read "
          "tool instead of cat/head/sed on files. A refused command costs a turn you may not get back."),
         "- Report problems that need an engineer, not noise. One finding per distinct problem; group repeats.",
@@ -372,8 +372,21 @@ _AUTH_QUOTA = re.compile(
     r"|authentication|unauthorized|invalid.api.key|expired.token|oauth|please.*log.?in", re.I)
 
 
+def effective_engine(watch: dict, at: Optional[datetime] = None) -> str:
+    """Temporary explicit override expires without changing the configured engine."""
+    override = watch.get("engine_override")
+    if isinstance(override, dict) and override.get("engine") in ("claude", "codex"):
+        try:
+            expires = datetime.fromisoformat(override["expires_at"])
+            if expires.tzinfo is not None and (at or datetime.now(timezone.utc)) < expires:
+                return override["engine"]
+        except (ValueError, TypeError, KeyError):
+            pass
+    return watch.get("engine", "claude")
+
+
 def _cooling(watch: dict) -> bool:
-    if watch.get("cooldown_engine") != watch.get("engine", "claude"):
+    if watch.get("cooldown_engine") != effective_engine(watch):
         return False
     try:
         until = datetime.fromisoformat(watch.get("cooldown_until") or "")
@@ -384,10 +397,10 @@ def _cooling(watch: dict) -> bool:
 
 def _preflight(watch: dict) -> Optional[str]:
     """Local capability checks only; no auth probes, models or engine fallback."""
-    engine = watch.get("engine", "claude")
+    engine = effective_engine(watch)
     if engine not in ("claude", "codex"):
         return "Unsupported selected watch engine"
-    if engine == "codex" and not watch.get("issue_repo"):
+    if engine == "codex" and not watch.get("issue_repo") and watch.get("id") not in ("sentry", "prod-logs", "desk-ci-fixes"):
         return "Codex issue watches require issue_repo for a read-only snapshot"
     selected = cli_path(engine)
     if not shutil.which(selected):
@@ -442,11 +455,11 @@ def start(watch_id: str, source: str = "schedule") -> dict:
         if source == "schedule" and _cooling(watch) and watch.get("last_run_id"):
             try:
                 previous = Run(watch["last_run_id"]).meta()
-                if previous.get("status") == "failed" and previous.get("engine") == watch.get("engine", "claude"):
+                if previous.get("status") == "failed" and previous.get("engine") == effective_engine(watch):
                     return previous
             except (OSError, ValueError):
                 pass
-        engine = watch.get("engine", "claude")
+        engine = effective_engine(watch)
         preflight_error = _preflight(watch)
         every_turn, first_turn = cli_args(engine)
         run = Run.create(engine, prompt(watch), workdir(), "readonly", source=source,
@@ -468,17 +481,20 @@ def start(watch_id: str, source: str = "schedule") -> dict:
     def work():
         try:
             if engine == "codex":
-                if not watch.get("issue_repo"):
-                    raise ValueError("Codex issue watches require issue_repo for a read-only snapshot")
-                from .watch_snapshot import collect
-                snapshot = collect(watch["issue_repo"])
+                if watch.get("issue_repo"):
+                    from .watch_snapshot import collect
+                    snapshot = collect(watch["issue_repo"])
+                else:
+                    from .watch_source_snapshot import collect
+                    snapshot = collect(watch)
+                run.update_meta(watch_source_errors=snapshot.get("source_errors", []))
                 isolated = Path(tempfile.mkdtemp(prefix="neo-watch-" + run.id + "-"))
                 (isolated / "github-snapshot.json").write_text(json.dumps(snapshot))
                 instructions = (
-                    "\n\nGitHub evidence has already been fetched by the trusted read-only collector. "
+                    "\n\nSource evidence has already been fetched by the trusted read-only collector. "
                     "Read github-snapshot.json in the current directory using python3. Inspect counts and a compact "
                     "title index first, then selected issue bodies/comments; do not dump the entire large snapshot. "
-                    "It contains ALL open bug issues "
+                    "For issue-scoped watches only, it contains ALL open bug issues "
                     "in the scoped repo, complete comments, cross-referenced PRs and available project/deploy metadata. "
                     "The snapshot uses GitHub GraphQL connection objects (nodes). Network is deliberately blocked; "
                     "do not run gh, curl or try to enable network. You may read local repo history using absolute paths. "
@@ -584,13 +600,16 @@ def finish(watch: dict, run: Run, started: str) -> list[dict]:
                               "run_id": run.id, "work": None}
                 new.append(store[fid])
         _write("findings.json", store)
-    run.update_meta(watch_summary=str(answer.get("summary") or "")[:2000], watch_found=len(answer["findings"]),
+    source_errors = run.meta().get("watch_source_errors") or []
+    summary = ("Check incomplete: " + "; ".join(str(e) for e in source_errors)) if source_errors else str(answer.get("summary") or "")
+    run.update_meta(watch_summary=summary[:2000], watch_found=len(answer["findings"]),
                     watch_new=len(new))
     try:  # when this check started, in local time (the next check looks from there)
         started = datetime.fromisoformat(started).astimezone().replace(tzinfo=None).isoformat(timespec="seconds")
     except ValueError:
         started = datetime.now().isoformat(timespec="seconds")
-    _update(watch["id"], last_ok_at=started)
+    if not source_errors:
+        _update(watch["id"], last_ok_at=started)
     return new
 
 

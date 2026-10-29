@@ -5,7 +5,7 @@ Run by launchd on weekdays alongside the 10:00 triage. At most one DM per owner 
 bot comments do not reset the human-update clock. Successful sends are persisted for retries.
 
   bug_dms.py --dry-run          write the messages to dms-<date>.json, send nothing
-  bug_dms.py --only bala-anyteam  send to one owner (for testing)
+  bug_dms.py --only anil-anyteam  send to one teammate (for testing)
 """
 import argparse, datetime as dt, fcntl, json, re, sys, urllib.request
 from collections import defaultdict
@@ -17,14 +17,14 @@ HERE = cos_home() / "triage"
 STATE = HERE / "bug-followup-state.json"  # Successful deliveries keyed by UTC day and owner.
 REPO = "AnyTeamAI/anyteam-design"
 ENV = Path.home() / "neo" / ".env"
-SLACK = {  # GitHub login -> Slack user id
-    "bala-anyteam": "U0ACTTMMRPS", "sachin-anyteam": "U099SGQPTQU", "praveen-anyteam": "U09V0PLDL8N",
-    "chrislarson1": "U07DVGDRWD7", "utkarsh-anyteam": "U0C8A1Q7KHR", "farhan-anyteam": "U0C8MLE5T63",
-    "shubham-anyteam": "U09RTGQHNJ2", "anil-anyteam": "U0ABVSG4ZPX", "satish-anyteam": "U09RZEP2S2G",
-    "jai-anyteam": "U0BC76N0SP4", "theo165": "U096PDJSEH4", "james-anyteam": "U0A6J1NCNA1",
-    "yosh-anyteam": "U055WEGBFEE", "sejal-anyteam": "U05B867NJCW",
+CONFIG = Path.home() / ".config" / "chakor" / "config.json"
+TEAMMATE_ALIASES = {  # GitHub login -> configured Chakor destination
+    "sachin-anyteam": "sachin", "praveen-anyteam": "praveen", "chrislarson1": "chris",
+    "utkarsh-anyteam": "utkarsh", "farhan-anyteam": "farhan", "shubham-anyteam": "shubham",
+    "anil-anyteam": "anil", "satish-anyteam": "satish", "jai-anyteam": "jai", "theo165": "theo",
+    "james-anyteam": "james", "yosh-anyteam": "yosh", "sejal-anyteam": "sejal",
 }
-FIRST = {"bala-anyteam": "Bala", "sachin-anyteam": "Sachin", "praveen-anyteam": "Praveen", "chrislarson1": "Chris",
+FIRST = {"sachin-anyteam": "Sachin", "praveen-anyteam": "Praveen", "chrislarson1": "Chris",
          "utkarsh-anyteam": "Utkarsh", "farhan-anyteam": "Farhan", "shubham-anyteam": "Shubham", "anil-anyteam": "Anil",
          "satish-anyteam": "Satish", "jai-anyteam": "Jai", "theo165": "Theo", "james-anyteam": "James",
          "yosh-anyteam": "Yosh", "sejal-anyteam": "Sejal"}
@@ -32,13 +32,25 @@ RANK = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3, "Untriaged": 4}
 OLD_DAYS = 14
 
 
+def configured_destinations():
+    destinations = json.loads(CONFIG.read_text())["parts"]["slack"]["destinations"]
+    return {login: destinations[alias] for login, alias in TEAMMATE_ALIASES.items() if alias in destinations}
+
+
 def severity(issue):
-    labels = [l["name"] for l in issue["labels"]]
-    t = issue["title"].upper()
-    if "critical" in labels or "CRITICAL" in t: return "Critical"
-    if "high-priority" in labels or " HIGH" in t or "HIGH]" in t: return "High"
-    if "medium-priority" in labels or "MEDIUM" in t or " MED]" in t: return "Medium"
-    if "low-priority" in labels or " LOW" in t: return "Low"
+    project_items = issue.get("projectItems", [])
+    if isinstance(project_items, dict):
+        project_items = project_items.get("nodes", [])
+    for item in project_items:
+        if (item.get("project") or {}).get("number") != 15:
+            continue
+        values = item.get("fieldValues", [])
+        if isinstance(values, dict):
+            values = values.get("nodes", [])
+        for value in values:
+            if (value.get("field") or {}).get("name") == "Priority":
+                priority = value.get("name")
+                return priority if priority in RANK else "Untriaged"
     return "Untriaged"
 
 
@@ -86,7 +98,7 @@ def last_human_update(issue):
 
 def eligible(issue, now):
     return (issue.get("state", "OPEN") == "OPEN"
-            and any(label["name"] == "bug" for label in issue["labels"])
+            and (issue.get("issueType") or {}).get("name") == "Bug"
             and now - last_human_update(issue) > dt.timedelta(days=OLD_DAYS))
 
 
@@ -123,6 +135,7 @@ def _main():
     now = dt.datetime.now(dt.timezone.utc)
     from .watch_snapshot import collect
     raw = collect(REPO, include_metadata=False)["issues"]
+    destinations = configured_destinations()
     per = defaultdict(list)
     for i in raw:
         if isinstance(i["labels"], dict):
@@ -134,7 +147,8 @@ def _main():
         b = {"n": i["number"], "sev": severity(i), "title": short_title(i["title"]),
              "age": (now - last_human_update(i)).days}
         for a in i["assignees"]:
-            per[a["login"]].append(b)
+            if a["login"] in destinations:
+                per[a["login"]].append(b)
     HERE.mkdir(parents=True, exist_ok=True)
     prev = json.loads(STATE.read_text()) if STATE.exists() else {}
     stamp = now.date().isoformat()
@@ -145,7 +159,7 @@ def _main():
         bugs.sort(key=lambda b: (RANK[b["sev"]], -b["age"]))
         if not args.dry_run and prev.get(stamp + ":" + who):
             continue
-        out[who] = {"slack": SLACK.get(who), "issues": [b["n"] for b in bugs], "text": message(who, bugs)}
+        out[who] = {"slack": destinations[who], "issues": [b["n"] for b in bugs], "text": message(who, bugs)}
     (HERE / f"dms-{stamp}.json").write_text(json.dumps(out, indent=1))
     if args.dry_run:
         print(f"dry run: {len(out)} messages in dms-{stamp}.json")

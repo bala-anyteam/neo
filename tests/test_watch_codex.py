@@ -116,3 +116,7 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(args[:3], ['gh','api','graphql'])
         self.assertIn('owner=acme',args)
         self.assertNotIn('mutation', ' '.join(args))
+        query = args[args.index('-f') + 1]
+        self.assertIn('issueType{name}', query)
+        self.assertIn('ProjectV2SingleSelectField', query)
+        self.assertNotIn('labels:["bug"]', query)

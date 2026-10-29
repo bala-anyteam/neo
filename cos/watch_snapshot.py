@@ -10,8 +10,12 @@ import subprocess
 from datetime import datetime, timezone, timedelta
 
 ISSUE_FIELDS = '''number title url body createdAt updatedAt lastEditedAt editor{login __typename}
+issueType{name}
 assignees(first:100){nodes{login}}
 labels(first:100){nodes{name}}
+projectItems(first:20){nodes{project{number} fieldValues(first:50){nodes{
+... on ProjectV2ItemFieldSingleSelectValue{name field{... on ProjectV2SingleSelectField{name}}}
+}}}}
 comments(first:100){nodes{author{login __typename} body createdAt url lastEditedAt editor{login __typename}} pageInfo{hasNextPage endCursor}}
 timelineItems(first:100,itemTypes:[CROSS_REFERENCED_EVENT]){
  nodes{... on CrossReferencedEvent{createdAt source{... on PullRequest{
@@ -43,7 +47,7 @@ def collect(repo: str, include_metadata: bool = True) -> dict:
         raise ValueError('issue_repo must be owner/repo')
     owner, name = repo.split('/')
     query = '''query($owner:String!,$name:String!,$cursor:String){
- repository(owner:$owner,name:$name){issues(first:20,after:$cursor,states:OPEN,labels:["bug"]){
+ repository(owner:$owner,name:$name){issues(first:20,after:$cursor,states:OPEN){
  nodes{''' + ISSUE_FIELDS + '''} pageInfo{hasNextPage endCursor}}}}'''
     issues, cursor = [], None
     while True:

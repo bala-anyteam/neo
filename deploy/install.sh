@@ -46,6 +46,9 @@ echo "  $PY"
 say "Tests"
 "$PY" -m unittest discover -s tests 2>&1 | tail -1
 
+say "Retire superseded weekday bug follow-up scheduler"
+"$PY" deploy/retire_legacy_scheduler.py
+
 # Prefer a plain CLI build: the Tailscale.app binary tries to open its GUI and hangs over SSH.
 # TAILSCALE_BIN (environment or .env) points at a specific tailscale binary.
 TS=""
